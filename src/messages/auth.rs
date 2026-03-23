@@ -464,27 +464,38 @@ impl AuthMessage {
     }
 
     /// Read a string in AUTH response format: indicator + length + length_confirm + data
+    ///
+    /// The indicator byte can be:
+    /// - 0: absent/empty string
+    /// - 1: string follows (length + length_confirm + data)
+    /// - 2: extra sub-indicator byte follows (used by Oracle 19c+)
     fn read_auth_string(buf: &mut ReadBuffer) -> Result<String> {
-        // Read indicator (1 = present, 0 = absent/empty)
         let indicator = buf.read_u8()?;
         if indicator == 0 {
             return Ok(String::new());
+        }
+
+        // Oracle 19c+ may use indicator=2, which prepends a sub-indicator byte
+        if indicator == 2 {
+            let sub_indicator = buf.read_u8()?;
+            if sub_indicator == 0 {
+                return Ok(String::new());
+            }
         }
 
         // Read length and length confirmation
         let len = buf.read_u8()? as usize;
         let len_confirm = buf.read_u8()? as usize;
 
-        if len != len_confirm {
-            // Log warning but continue - some edge cases may have mismatches
-        }
+        // Oracle 19c encodes the length differently (len can be len_confirm * 3).
+        // len_confirm is the actual byte count of the data that follows.
+        let actual_len = if len != len_confirm { len_confirm } else { len };
 
-        // Read data bytes
-        if len == 0 {
+        if actual_len == 0 {
             return Ok(String::new());
         }
 
-        let bytes = buf.read_bytes_vec(len)?;
+        let bytes = buf.read_bytes_vec(actual_len)?;
         Ok(String::from_utf8_lossy(&bytes).to_string())
     }
 
