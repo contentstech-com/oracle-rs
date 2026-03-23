@@ -3359,7 +3359,11 @@ impl Connection {
         let data_bytes = buf.read_bytes_with_length()?;
 
         // Handle JSON columns - decode OSON format
+        // JSON is sent as a LOB with prefetched data + a LOB locator that must be consumed
         if col.oracle_type == OracleType::Json || col.is_json {
+            // Read and discard the LOB locator
+            let _locator = buf.read_bytes_with_length()?;
+
             if let Some(data) = data_bytes {
                 if !data.is_empty() {
                     // Decode OSON to JSON
