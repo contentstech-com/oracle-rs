@@ -5,6 +5,7 @@
 //! between Rust's serde_json::Value and Oracle's OSON wire format.
 
 use crate::{Error, Result};
+use super::binary::{decode_binary_double, decode_binary_float};
 use bytes::Bytes;
 use std::collections::HashMap;
 
@@ -322,33 +323,14 @@ impl OsonDecoder {
             // Binary double
             TYPE_BINARY_DOUBLE => {
                 let bytes = self.read_bytes(8)?;
-                // Oracle binary double: first flip sign bit, then reverse if negative
-                let mut arr = [0u8; 8];
-                arr.copy_from_slice(&bytes);
-                // Toggle sign bit
-                arr[0] ^= 0x80;
-                // If original was negative (after toggle, sign bit is 0), flip all bits
-                if (arr[0] & 0x80) == 0 {
-                    for b in &mut arr {
-                        *b = !*b;
-                    }
-                }
-                let value = f64::from_be_bytes(arr);
+                let value = decode_binary_double(&bytes);
                 Ok(serde_json::json!(value))
             }
 
             // Binary float
             TYPE_BINARY_FLOAT => {
                 let bytes = self.read_bytes(4)?;
-                let mut arr = [0u8; 4];
-                arr.copy_from_slice(&bytes);
-                arr[0] ^= 0x80;
-                if (arr[0] & 0x80) == 0 {
-                    for b in &mut arr {
-                        *b = !*b;
-                    }
-                }
-                let value = f32::from_be_bytes(arr);
+                let value = decode_binary_float(&bytes);
                 Ok(serde_json::json!(value))
             }
 
@@ -463,35 +445,34 @@ impl OsonDecoder {
             _ => unreachable!(),
         };
 
-        // Handle shared field IDs (for objects that share structure)
-        if is_shared {
+        // Determine field_ids_pos and offsets_pos based on whether field IDs
+        // are shared with another node or local.
+        let (mut field_ids_pos, mut offsets_pos, num_children) = if is_shared {
+            // Shared: read offset to the shared node, save current pos as offsets_pos,
+            // then jump to shared node to get num_children and field_ids_pos
             let offset = self.get_offset(node_type)?;
-            let saved_pos = self.pos;
+            let local_offsets_pos = self.pos;
             self.pos = self.tree_seg_pos + offset as usize;
             let shared_node_type = self.read_u8()?;
             let shared_children_bits = shared_node_type & 0x18;
-            let _num_children = match shared_children_bits {
+            let nc = match shared_children_bits {
                 0x00 => self.read_u8()? as u32,
                 0x08 => self.read_u16_be()? as u32,
                 0x10 => self.read_u32_be()?,
                 _ => 0,
             };
-            // This would require more complex handling - for now return empty object
-            self.pos = saved_pos;
-            if is_object {
-                return Ok(serde_json::Value::Object(serde_json::Map::new()));
-            } else {
-                return Ok(serde_json::Value::Array(vec![]));
-            }
-        }
+            let shared_field_ids_pos = self.pos;
+            (shared_field_ids_pos, local_offsets_pos, nc)
+        } else if is_object {
+            let fids = self.pos;
+            let offs = fids + self.field_id_length * num_children as usize;
+            (fids, offs, num_children)
+        } else {
+            (0, self.pos, num_children)
+        };
 
         if is_object {
             let mut map = serde_json::Map::new();
-
-            // Read field IDs and value offsets sequentially, following
-            // python-oracledb's approach of tracking positions as we go
-            let mut field_ids_pos = self.pos;
-            let mut offsets_pos = field_ids_pos + self.field_id_length * num_children as usize;
 
             for _i in 0..num_children {
                 // Read field ID
