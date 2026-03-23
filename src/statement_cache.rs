@@ -4,6 +4,15 @@
 //! parsing of SQL statements on the Oracle server. When a statement is
 //! executed, its cursor ID and metadata are cached. Subsequent executions
 //! of the same SQL text can reuse the cached cursor, skipping the parse phase.
+//!
+//! # Known limitation: server-side cursor cleanup
+//!
+//! When a cursor completes or a cached statement is evicted, we reset the
+//! cursor_id to 0 locally but do not send a cursor-close message to the
+//! server. Python-oracledb piggybacks close-cursor requests on subsequent
+//! messages to free server resources. For long-running connections with many
+//! distinct SQL statements, this could lead to server-side cursor accumulation.
+//! Oracle will eventually reclaim these, but explicit cleanup would be better.
 
 use indexmap::IndexMap;
 use std::time::Instant;

@@ -749,4 +749,59 @@ mod tests {
         msg.clear_password();
         assert!(msg.password.is_empty());
     }
+
+    #[test]
+    fn test_read_auth_string_indicator_0() {
+        // indicator=0 means empty/absent
+        let data = [0x00];
+        let mut buf = ReadBuffer::from_slice(&data);
+        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_read_auth_string_indicator_1() {
+        // indicator=1, len=5, len_confirm=5, data="HELLO"
+        let data = [0x01, 0x05, 0x05, b'H', b'E', b'L', b'L', b'O'];
+        let mut buf = ReadBuffer::from_slice(&data);
+        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
+        assert_eq!(result, "HELLO");
+    }
+
+    #[test]
+    fn test_read_auth_string_indicator_2_with_data() {
+        // indicator=2, sub_indicator=1, len=3, len_confirm=3, data="ABC"
+        let data = [0x02, 0x01, 0x03, 0x03, b'A', b'B', b'C'];
+        let mut buf = ReadBuffer::from_slice(&data);
+        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
+        assert_eq!(result, "ABC");
+    }
+
+    #[test]
+    fn test_read_auth_string_indicator_2_absent() {
+        // indicator=2, sub_indicator=0 means absent
+        let data = [0x02, 0x00];
+        let mut buf = ReadBuffer::from_slice(&data);
+        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn test_read_auth_string_length_mismatch() {
+        // Oracle 19c: len != len_confirm, use len_confirm as actual length
+        // len=9 (3*3), len_confirm=3, data="XYZ"
+        let data = [0x01, 0x09, 0x03, b'X', b'Y', b'Z'];
+        let mut buf = ReadBuffer::from_slice(&data);
+        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
+        assert_eq!(result, "XYZ");
+    }
+
+    #[test]
+    fn test_read_auth_string_empty_data() {
+        // indicator=1, len=0, len_confirm=0
+        let data = [0x01, 0x00, 0x00];
+        let mut buf = ReadBuffer::from_slice(&data);
+        let result = AuthMessage::read_auth_string(&mut buf).unwrap();
+        assert_eq!(result, "");
+    }
 }

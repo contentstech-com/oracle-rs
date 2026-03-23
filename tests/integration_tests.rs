@@ -4771,4 +4771,102 @@ mod statement_cache_reuse_tests {
         conn.execute("DROP TABLE test_cache_dml", &[]).await.expect("Failed to drop table");
         conn.close().await.expect("Failed to close");
     }
+
+    /// Test statement cache with parameterized queries returning real table data.
+    /// Verifies values aren't corrupted across repeated executions with different binds.
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
+    async fn test_cached_query_with_bind_params_returns_correct_values() {
+        use oracle_rs::Value;
+        let conn = connect().await.expect("Failed to connect");
+
+        let sql = "SELECT emp_id, first_name, salary FROM test_employees WHERE dept_id = :1 ORDER BY emp_id";
+
+        // First execution — dept 1 (Engineering: John, Jane)
+        let r1 = conn.query(sql, &[1i64.into()]).await.expect("First query failed");
+        assert_eq!(r1.row_count(), 2, "Dept 1 should have 2 employees");
+        assert_eq!(r1.rows[0].get_string(1), Some("John"));
+        assert_eq!(r1.rows[1].get_string(1), Some("Jane"));
+
+        // Second execution with different bind — dept 2 (Marketing: Bob)
+        let r2 = conn.query(sql, &[2i64.into()]).await.expect("Second query failed");
+        assert_eq!(r2.row_count(), 1, "Dept 2 should have 1 employee");
+        assert_eq!(r2.rows[0].get_string(1), Some("Bob"));
+
+        // Third execution — back to dept 1, verify values aren't stale
+        let r3 = conn.query(sql, &[1i64.into()]).await.expect("Third query failed");
+        assert_eq!(r3.row_count(), 2);
+        assert_eq!(r3.rows[0].get_string(1), Some("John"));
+
+        conn.close().await.expect("Failed to close");
+    }
+}
+
+mod json_nesting_tests {
+    use super::*;
+    use oracle_rs::Value;
+
+    /// Test OSON decoding with nested JSON structures: objects within arrays within objects
+    #[tokio::test]
+    #[ignore = "requires Oracle database with JSON support (21c+)"]
+    async fn test_json_nested_objects_and_arrays() {
+        let conn = connect().await.expect("Failed to connect");
+
+        conn.execute(
+            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE json_nested_test (id NUMBER PRIMARY KEY, data JSON)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
+            &[]
+        ).await.expect("Failed to create table");
+
+        conn.execute("DELETE FROM json_nested_test", &[]).await.ok();
+
+        // Insert nested JSON: object with array of objects
+        conn.execute(
+            "INSERT INTO json_nested_test (id, data) VALUES (1, JSON_OBJECT(
+                'name' VALUE 'team',
+                'members' VALUE JSON_ARRAY(
+                    JSON_OBJECT('name' VALUE 'Alice', 'role' VALUE 'lead'),
+                    JSON_OBJECT('name' VALUE 'Bob', 'role' VALUE 'dev')
+                ),
+                'count' VALUE 2
+            ))",
+            &[]
+        ).await.expect("Failed to insert nested JSON");
+
+        // Insert simpler JSON for second row
+        conn.execute(
+            "INSERT INTO json_nested_test (id, data) VALUES (2, JSON_OBJECT('status' VALUE 'active'))",
+            &[]
+        ).await.expect("Failed to insert simple JSON");
+
+        conn.commit().await.expect("Failed to commit");
+
+        let result = conn.query("SELECT id, data FROM json_nested_test ORDER BY id", &[])
+            .await.expect("Query failed");
+
+        assert_eq!(result.row_count(), 2, "Should have 2 rows");
+
+        // Verify nested structure
+        if let Some(Value::Json(json)) = result.rows[0].get(1) {
+            assert_eq!(json.get("name").and_then(|v| v.as_str()), Some("team"));
+            let members = json.get("members").and_then(|v| v.as_array());
+            assert!(members.is_some(), "Should have members array");
+            let members = members.unwrap();
+            assert_eq!(members.len(), 2);
+            assert_eq!(members[0].get("name").and_then(|v| v.as_str()), Some("Alice"));
+            assert_eq!(members[0].get("role").and_then(|v| v.as_str()), Some("lead"));
+            assert_eq!(members[1].get("name").and_then(|v| v.as_str()), Some("Bob"));
+        } else {
+            panic!("Expected JSON value for row 1, got {:?}", result.rows[0].get(1));
+        }
+
+        // Verify simpler row wasn't affected
+        if let Some(Value::Json(json)) = result.rows[1].get(1) {
+            assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("active"));
+        } else {
+            panic!("Expected JSON value for row 2, got {:?}", result.rows[1].get(1));
+        }
+
+        conn.execute("DROP TABLE json_nested_test", &[]).await.ok();
+        conn.close().await.expect("Failed to close");
+    }
 }
