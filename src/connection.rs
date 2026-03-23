@@ -933,59 +933,81 @@ impl Connection {
         inner.send(&connect_packet).await?;
 
         // If we have a continuation DATA packet (for large connect strings), send it
-        if let Some(data_packet) = continuation {
-            inner.send(&data_packet).await?;
+        if let Some(ref data_packet) = continuation {
+            inner.send(data_packet).await?;
         }
 
-        // Wait for response
-        let response = inner.receive().await?;
+        const MAX_RESENDS: u8 = 3;
+        let mut resend_count: u8 = 0;
 
-        // Parse response packet type
-        if response.len() < PACKET_HEADER_SIZE {
-            return Err(Error::PacketTooShort {
-                expected: PACKET_HEADER_SIZE,
-                actual: response.len(),
-            });
-        }
+        loop {
+            // Wait for response
+            let response = inner.receive().await?;
 
-        let packet_type = response[4];
-
-        match packet_type {
-            2 => {
-                // ACCEPT - parse the accept message to get protocol version and capabilities
-                let packet = Packet::from_bytes(response)?;
-                let accept = AcceptMessage::parse(&packet)?;
-
-                // Set large_sdu mode if protocol version >= 315
-                inner.large_sdu = accept.uses_large_sdu();
-
-                // Update server info
-                inner.server_info.protocol_version = accept.protocol_version;
-                inner.server_info.supports_oob = accept.supports_oob;
-                inner.sdu_size = accept.sdu.min(65535) as u16;
-
-                inner.state = ConnectionState::Connected;
-                Ok(())
+            // Parse response packet type
+            if response.len() < PACKET_HEADER_SIZE {
+                return Err(Error::PacketTooShort {
+                    expected: PACKET_HEADER_SIZE,
+                    actual: response.len(),
+                });
             }
-            4 => {
-                // REFUSE
-                let mut buf = ReadBuffer::new(response.slice(PACKET_HEADER_SIZE..));
-                let _reason = buf.read_u8()?;
-                let _user_reason = buf.read_u8()?;
 
-                Err(Error::ConnectionRefused {
-                    error_code: None,
-                    message: Some("Connection refused by server".to_string()),
-                })
+            let packet_type = response[4];
+
+            match packet_type {
+                2 => {
+                    // ACCEPT - parse the accept message to get protocol version and capabilities
+                    let packet = Packet::from_bytes(response)?;
+                    let accept = AcceptMessage::parse(&packet)?;
+
+                    // Set large_sdu mode if protocol version >= 315
+                    inner.large_sdu = accept.uses_large_sdu();
+
+                    // Update server info
+                    inner.server_info.protocol_version = accept.protocol_version;
+                    inner.server_info.supports_oob = accept.supports_oob;
+                    inner.sdu_size = accept.sdu.min(65535) as u16;
+
+                    inner.state = ConnectionState::Connected;
+                    return Ok(());
+                }
+                4 => {
+                    // REFUSE
+                    let mut buf = ReadBuffer::new(response.slice(PACKET_HEADER_SIZE..));
+                    let _reason = buf.read_u8()?;
+                    let _user_reason = buf.read_u8()?;
+
+                    return Err(Error::ConnectionRefused {
+                        error_code: None,
+                        message: Some("Connection refused by server".to_string()),
+                    });
+                }
+                5 => {
+                    // REDIRECT
+                    return Err(Error::ConnectionRedirect(
+                        "redirect not implemented".to_string(),
+                    ));
+                }
+                11 => {
+                    // RESEND - server requests retransmission of the connect packet
+                    resend_count += 1;
+                    if resend_count > MAX_RESENDS {
+                        return Err(Error::ProtocolError(
+                            "Server requested too many resends during connect".to_string(),
+                        ));
+                    }
+                    inner.send(&connect_packet).await?;
+                    if let Some(ref data_packet) = continuation {
+                        inner.send(data_packet).await?;
+                    }
+                }
+                _ => {
+                    return Err(Error::ProtocolError(format!(
+                        "Unexpected packet type during connect: {}",
+                        packet_type,
+                    )));
+                }
             }
-            5 => {
-                // REDIRECT
-                Err(Error::ConnectionRedirect("redirect not implemented".to_string()))
-            }
-            _ => Err(Error::ProtocolError(format!(
-                "Unexpected packet type during connect: {}",
-                packet_type
-            ))),
         }
     }
 
