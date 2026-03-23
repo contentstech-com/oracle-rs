@@ -488,19 +488,21 @@ impl OsonDecoder {
         if is_object {
             let mut map = serde_json::Map::new();
 
-            // Read field IDs
-            let field_ids_pos = self.pos;
-            let offsets_pos = field_ids_pos + self.field_id_length * num_children as usize;
+            // Read field IDs and value offsets sequentially, following
+            // python-oracledb's approach of tracking positions as we go
+            let mut field_ids_pos = self.pos;
+            let mut offsets_pos = field_ids_pos + self.field_id_length * num_children as usize;
 
-            for i in 0..num_children {
+            for _i in 0..num_children {
                 // Read field ID
-                self.pos = field_ids_pos + (i as usize * self.field_id_length);
+                self.pos = field_ids_pos;
                 let field_id = match self.field_id_length {
                     1 => self.read_u8()? as usize,
                     2 => self.read_u16_be()? as usize,
                     4 => self.read_u32_be()? as usize,
                     _ => unreachable!(),
                 };
+                field_ids_pos = self.pos;
 
                 // Get field name
                 let field_name = if field_id > 0 && field_id <= self.field_names.len() {
@@ -510,8 +512,9 @@ impl OsonDecoder {
                 };
 
                 // Read value offset
-                self.pos = offsets_pos + (i as usize * 4); // Offsets are 4 bytes (uint32)
+                self.pos = offsets_pos;
                 let value_offset = self.get_offset(node_type)?;
+                offsets_pos = self.pos;
 
                 // Calculate actual offset
                 let actual_offset = if self.relative_offsets {
@@ -530,11 +533,12 @@ impl OsonDecoder {
         } else {
             // Array
             let mut arr = Vec::with_capacity(num_children as usize);
-            let offsets_pos = self.pos;
+            let mut offsets_pos = self.pos;
 
-            for i in 0..num_children {
-                self.pos = offsets_pos + (i as usize * 4);
+            for _i in 0..num_children {
+                self.pos = offsets_pos;
                 let value_offset = self.get_offset(node_type)?;
+                offsets_pos = self.pos;
 
                 let actual_offset = if self.relative_offsets {
                     container_offset as u32 + value_offset

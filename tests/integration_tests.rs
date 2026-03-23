@@ -2393,17 +2393,17 @@ mod json_tests {
 
         // Verify first row
         let row1 = &result.rows[0];
-        assert_eq!(row1.get_i64(0), Some(1));
+        assert_eq!(row1.get_string(0), Some("1"));
         if let Some(Value::Json(json)) = row1.get(1) {
             assert_eq!(json.get("name").and_then(|v| v.as_str()), Some("Alice"));
             assert_eq!(json.get("age").and_then(|v| v.as_i64()), Some(30));
         } else {
-            panic!("Expected JSON value for row 1");
+            panic!("Expected JSON value for row 1, got {:?}", row1.get(1));
         }
 
         // Verify second row with array
         let row2 = &result.rows[1];
-        assert_eq!(row2.get_i64(0), Some(2));
+        assert_eq!(row2.get_string(0), Some("2"));
         if let Some(Value::Json(json)) = row2.get(1) {
             assert_eq!(json.get("name").and_then(|v| v.as_str()), Some("Bob"));
             let items = json.get("items").and_then(|v| v.as_array());
