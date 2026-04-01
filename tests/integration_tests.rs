@@ -149,6 +149,20 @@ mod query_tests {
 
     #[tokio::test]
     #[ignore = "requires Oracle database"]
+    async fn test_execute_select_returns_rows() {
+        let conn = connect().await.expect("Failed to connect");
+
+        let result = conn.execute("SELECT 1 FROM DUAL", &[]).await
+            .expect("Execute SELECT failed");
+
+        assert_eq!(result.row_count(), 1);
+        assert!(!result.is_empty());
+
+        conn.close().await.expect("Failed to close");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
     async fn test_sysdate_query() {
         let conn = connect().await.expect("Failed to connect");
 
@@ -3364,32 +3378,52 @@ mod lob_workaround_tests {
     #[ignore = "requires Oracle database"]
     async fn test_dbms_lob_returning_into() {
         let conn = connect().await.expect("Failed to connect");
+        let test_id = 11_004;
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.subsec_nanos() % 100_000)
+            .unwrap_or(0);
+        let table_name = format!("lobret_{}_{}", std::process::id(), suffix);
 
         // Create test table
-        conn.execute(
-            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE dbms_lob_test (id NUMBER, content CLOB)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
-            &[]
-        ).await.expect("Failed to create table");
+        let create_sql = format!("CREATE TABLE {} (id NUMBER, content CLOB)", table_name);
+        conn.execute(&create_sql, &[]).await.expect("Failed to create table");
 
-        conn.execute("DELETE FROM dbms_lob_test WHERE id = 1", &[]).await.ok();
+        conn.execute(
+            &format!("DELETE FROM {} WHERE id = {}", table_name, test_id),
+            &[]
+        ).await.ok();
 
         // Use PL/SQL to insert and get the LOB locator in one operation
-        conn.execute(
+        let plsql = format!(
             "DECLARE
                v_clob CLOB;
              BEGIN
-               INSERT INTO dbms_lob_test (id, content) VALUES (:1, EMPTY_CLOB())
+               INSERT INTO {} (id, content) VALUES (:1, EMPTY_CLOB())
                  RETURNING content INTO v_clob;
-               DBMS_LOB.WRITEAPPEND(v_clob, LENGTH('Test content via DBMS_LOB'), 'Test content via DBMS_LOB');
+               DBMS_LOB.WRITEAPPEND(
+                 v_clob,
+                 LENGTH('Test content via DBMS_LOB'),
+                 'Test content via DBMS_LOB'
+               );
              END;",
-            &[1.into()]
+            table_name
+        );
+        conn.execute_plsql(
+            &plsql,
+            &[BindParam::input(test_id.into())]
         ).await.expect("Failed to execute PL/SQL");
 
         conn.commit().await.expect("Failed to commit");
 
         // Verify
+        let verify_sql = format!(
+            "SELECT content FROM {} WHERE id = {}",
+            table_name,
+            test_id
+        );
         let rows = conn.query(
-            "SELECT content FROM dbms_lob_test WHERE id = 1",
+            &verify_sql,
             &[]
         ).await.expect("Failed to query");
 
@@ -3413,7 +3447,7 @@ mod lob_workaround_tests {
         }
 
         // Clean up
-        conn.execute("DELETE FROM dbms_lob_test WHERE id = 1", &[]).await.ok();
+        conn.execute(&format!("DROP TABLE {} PURGE", table_name), &[]).await.ok();
         conn.commit().await.expect("Failed to commit cleanup");
         conn.close().await.expect("Failed to close");
     }
@@ -3461,7 +3495,7 @@ mod ref_cursor_tests {
 
         // Get the cursor from OUT parameter
         assert!(!result.out_values.is_empty(), "Should have OUT values");
-        
+
         if let Value::Cursor(ref cursor) = result.out_values[0] {
             // Debug: print cursor info
             println!("Cursor ID: {}", cursor.cursor_id());
@@ -3527,7 +3561,7 @@ mod ref_cursor_tests {
 
         if let Value::Cursor(ref cursor) = result.out_values[0] {
             let rows = conn.fetch_cursor(cursor).await.expect("Failed to fetch cursor");
-            
+
             // Should have 2 active records (id 2 and 4)
             assert_eq!(rows.row_count(), 2, "Should fetch 2 active rows");
         } else {
@@ -4777,7 +4811,6 @@ mod statement_cache_reuse_tests {
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_cached_query_with_bind_params_returns_correct_values() {
-        use oracle_rs::Value;
         let conn = connect().await.expect("Failed to connect");
 
         let sql = "SELECT emp_id, first_name, salary FROM test_employees WHERE dept_id = :1 ORDER BY emp_id";

@@ -8,7 +8,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use crate::buffer::WriteBuffer;
 use crate::capabilities::Capabilities;
 use crate::constants::{
-    ccap_value, exec_flags, exec_option, FunctionCode, MessageType, OracleType, PacketType,
+    ccap_value, exec_flags, exec_option, length, FunctionCode, MessageType, OracleType, PacketType,
     MAX_LONG_LENGTH, PACKET_HEADER_SIZE,
 };
 use crate::error::Result;
@@ -101,12 +101,12 @@ impl ExecuteOptions {
     /// ExecuteMessage with options = FETCH only.
     pub fn for_ref_cursor(fetch_size: u32) -> Self {
         Self {
-            parse: false,      // Cursor is already parsed by Oracle
-            execute: false,    // Don't set EXECUTE flag - cursor is already executed
-            fetch: fetch_size > 0,  // Only FETCH flag is needed
-            define: false,     // Don't set DEFINE flag - Oracle knows the column types
+            parse: false,          // Cursor is already parsed by Oracle
+            execute: false,        // Don't set EXECUTE flag - cursor is already executed
+            fetch: fetch_size > 0, // Only FETCH flag is needed
+            define: false,         // Don't set DEFINE flag - Oracle knows the column types
             prefetch_rows: fetch_size,
-            num_execs: fetch_size,  // This becomes the fetch array size
+            num_execs: fetch_size, // This becomes the fetch array size
             ..Default::default()
         }
     }
@@ -232,7 +232,12 @@ impl<'a> ExecuteMessage<'a> {
         let mut buf = WriteBuffer::new();
 
         // Data flags (2 bytes)
-        buf.write_u16_be(0)?;
+        let data_flags: u16 = if self.should_use_legacy_11g_query_layout(caps) {
+            0x2000
+        } else {
+            0
+        };
+        buf.write_u16_be(data_flags)?;
 
         match self.function_code {
             FunctionCode::Execute => self.write_execute_message(&mut buf, caps)?,
@@ -288,9 +293,9 @@ impl<'a> ExecuteMessage<'a> {
         if stmt.requires_define() {
             exec_opts |= exec_option::DEFINE;
         } else if !opts.describe_only && !stmt.sql().is_empty() {
-            // Only set IMPLICIT_RESULTSET and EXECUTE when we have SQL.
-            // REF CURSORs have no SQL and should not set these flags.
-            exec_flgs |= exec_flags::IMPLICIT_RESULTSET;
+            // REF CURSORs have no SQL and should not set execute flags here.
+            // IMPLICIT_RESULTSET is only needed for PL/SQL implicit result sets
+            // and causes compatibility issues with Oracle 11g queries.
             if opts.execute && !opts.scroll_operation {
                 exec_opts |= exec_option::EXECUTE;
             }
@@ -305,10 +310,24 @@ impl<'a> ExecuteMessage<'a> {
             exec_opts |= exec_option::PARSE;
         }
 
-        // Add FETCH flag for queries or when explicitly requested (e.g., REF CURSOR)
+        // Oracle 11g closes the cursor after the prefetched execute batch when
+        // FETCH is set on the initial query execute. Keep FETCH off only for
+        // that case so follow-up cursor fetches can still use FETCH-only
+        // execute messages.
+        let suppress_initial_11g_query_fetch = caps.ttc_field_version
+            <= ccap_value::FIELD_VERSION_11_2
+            && !self.should_use_legacy_11g_query_layout(caps)
+            && stmt.is_query()
+            && stmt.cursor_id() == 0
+            && opts.execute
+            && !opts.scroll_operation;
         if opts.describe_only {
             exec_opts |= exec_option::DESCRIBE;
-        } else if opts.fetch && opts.prefetch_rows > 0 && !stmt.no_prefetch() {
+        } else if opts.fetch
+            && opts.prefetch_rows > 0
+            && !stmt.no_prefetch()
+            && !suppress_initial_11g_query_fetch
+        {
             exec_opts |= exec_option::FETCH;
         }
 
@@ -326,12 +345,20 @@ impl<'a> ExecuteMessage<'a> {
             exec_opts |= exec_option::BATCH_ERRORS;
         }
 
-        if opts.dml_row_counts {
+        if opts.dml_row_counts && caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
             exec_flgs |= exec_flags::DML_ROWCOUNTS;
         }
 
         if opts.commit && !opts.describe_only {
             exec_opts |= exec_option::COMMIT;
+        }
+
+        if self.should_use_legacy_11g_fetch_layout(caps) {
+            return self.write_legacy_11g_fetch_message(buf, exec_opts, caps);
+        }
+
+        if self.should_use_legacy_11g_query_layout(caps) {
+            return self.write_legacy_11g_query_message(buf, exec_opts, caps);
         }
 
         // Determine number of iterations (prefetch rows for queries, num_execs for DML)
@@ -406,15 +433,17 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_ub4(0)?; // al8dnaml
         buf.write_ub4(0)?; // al8regid_msb
 
-        // DML row counts
-        if opts.dml_row_counts {
-            buf.write_u8(1)?; // Pointer (al8pidmlrc)
-            buf.write_ub4(opts.num_execs)?; // al8pidmlrcbl
-            buf.write_u8(1)?; // Pointer (al8pidmlrcl)
-        } else {
-            buf.write_u8(0)?; // Pointer (al8pidmlrc)
-            buf.write_ub4(0)?; // al8pidmlrcbl
-            buf.write_u8(0)?; // Pointer (al8pidmlrcl)
+        // DML row counts (TTC version >= 7 only; Oracle 11g is version 6)
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
+            if opts.dml_row_counts {
+                buf.write_u8(1)?; // Pointer (al8pidmlrc)
+                buf.write_ub4(opts.num_execs)?; // al8pidmlrcbl
+                buf.write_u8(1)?; // Pointer (al8pidmlrcl)
+            } else {
+                buf.write_u8(0)?; // Pointer (al8pidmlrc)
+                buf.write_ub4(0)?; // al8pidmlrcbl
+                buf.write_u8(0)?; // Pointer (al8pidmlrcl)
+            }
         }
 
         // Extended fields (12.2+)
@@ -424,7 +453,7 @@ impl<'a> ExecuteMessage<'a> {
             buf.write_u8(0)?; // Pointer (SQL ID)
             buf.write_ub4(0)?; // Allocated size of SQL ID
             buf.write_u8(0)?; // Pointer (length of SQL ID)
-            // Additional fields for 12.2 EXT1+ (TTC field version >= 9)
+                              // Additional fields for 12.2 EXT1+ (TTC field version >= 9)
             if caps.ttc_field_version >= 9 {
                 buf.write_u8(0)?; // Pointer (chunk ids)
                 buf.write_ub4(0)?; // Number of chunk ids
@@ -433,7 +462,7 @@ impl<'a> ExecuteMessage<'a> {
 
         // Write SQL if parsing
         if stmt.cursor_id() == 0 || stmt.is_ddl() {
-            buf.write_bytes_with_length(Some(stmt.sql_bytes()))?;
+            Self::write_sql_bytes_with_length(buf, caps, stmt.sql_bytes())?;
             buf.write_ub4(1)?; // al8i4[0] parse
         } else {
             buf.write_ub4(0)?; // al8i4[0] parse
@@ -458,7 +487,7 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_ub4(if stmt.is_query() { 1 } else { 0 })?; // al8i4[7] is query
         buf.write_ub4(0)?; // al8i4[8]
         buf.write_ub4(exec_flgs)?; // al8i4[9] execute flags
-        // For scrollable cursors, set fetch_orientation to CURRENT (1) and fetch_pos to 1
+                                   // For scrollable cursors, set fetch_orientation to CURRENT (1) and fetch_pos to 1
         let (fetch_ori, fetch_pos_val) = if opts.scrollable && !opts.scroll_operation {
             (1u32, 1u32)
         } else if opts.scroll_operation {
@@ -477,6 +506,219 @@ impl<'a> ExecuteMessage<'a> {
             // Write bind metadata and values if present (only when not defining)
             self.write_bind_params(buf, caps)?;
         }
+
+        Ok(())
+    }
+
+    fn should_use_legacy_11g_query_layout(&self, caps: &Capabilities) -> bool {
+        let stmt = self.statement;
+        let opts = &self.options;
+
+        caps.ttc_field_version == ccap_value::FIELD_VERSION_11_2
+            && stmt.is_query()
+            && stmt.cursor_id() == 0
+            && !stmt.sql().is_empty()
+            && !stmt.requires_define()
+            && !self.has_bind_values()
+            && !opts.describe_only
+            && opts.fetch
+            && opts.execute
+            && opts.prefetch_rows > 0
+            && !opts.scrollable
+            && !opts.scroll_operation
+            && !opts.batch_errors
+            && !opts.dml_row_counts
+    }
+
+    fn should_use_legacy_11g_fetch_layout(&self, caps: &Capabilities) -> bool {
+        let stmt = self.statement;
+        let opts = &self.options;
+
+        caps.ttc_field_version == ccap_value::FIELD_VERSION_11_2
+            && stmt.is_query()
+            && stmt.cursor_id() != 0
+            && stmt.sql().is_empty()
+            && stmt.executed()
+            && !stmt.requires_define()
+            && !self.has_bind_values()
+            && !opts.parse
+            && !opts.execute
+            && opts.fetch
+            && opts.prefetch_rows > 0
+            && !opts.describe_only
+            && !opts.scrollable
+            && !opts.scroll_operation
+            && !opts.batch_errors
+            && !opts.dml_row_counts
+    }
+
+    fn write_legacy_11g_query_message(
+        &self,
+        buf: &mut WriteBuffer,
+        exec_opts: u32,
+        caps: &Capabilities,
+    ) -> Result<()> {
+        let stmt = self.statement;
+
+        // Oracle 11g uses the OCI "thick" OALL8 wire format which is
+        // fundamentally different from the modern thin TTC layout.  The byte
+        // sequence below was captured from a successful OCI 11g execution
+        // (script/oracle_tns_dump.pcap, frame 41) and only covers the narrow
+        // "fresh cursor, unbound SELECT" path.
+        let prefetch_rows = self.options.prefetch_rows.clamp(1, 2);
+
+        // Fixed OALL8 template from the capture.  Fields that must vary
+        // (exec_opts, cursor_id, sql_len, prefetch_rows) are patched below.
+        let mut body = hex::decode(
+            "6180000000000000\
+             feffffffffffffff\
+             12000000\
+             feffffffffffffff\
+             0d000000\
+             fefffffffffffffffeffffffffffffff\
+             00000000\
+             02000000\
+             000000000000000000000000000000000000000000000000\
+             feffffffffffffff\
+             0000000000000000\
+             fefffffffffffffffefffffffffffffffeffffffffffffff\
+             0000000000000000\
+             fefffffffffffffffeffffffffffffff\
+             00000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("valid OALL8 template");
+
+        // Patch exec_opts at offset 0 (4 bytes LE)
+        body[0..4].copy_from_slice(&exec_opts.to_le_bytes());
+        // Patch cursor_id at offset 4 (4 bytes LE)
+        body[4..8].copy_from_slice(&(stmt.cursor_id() as u32).to_le_bytes());
+        // Patch sql_len at offset 16 (4 bytes LE)
+        body[16..20].copy_from_slice(&(stmt.sql_bytes().len() as u32).to_le_bytes());
+        // Patch prefetch_rows at offset 52 (4 bytes LE)
+        body[52..56].copy_from_slice(&prefetch_rows.to_le_bytes());
+
+        buf.write_u8(MessageType::Function as u8)?;
+        buf.write_u8(self.function_code as u8)?;
+        buf.write_u8(self.sequence_number)?;
+        buf.write_bytes(&body)?;
+
+        // SQL text (TNS chunked encoding)
+        Self::write_sql_bytes_with_length(buf, caps, stmt.sql_bytes())?;
+
+        // al8i4 tail (13 × u32 LE) matching the captured frame
+        for value in [1u32, 0, 0, 0, 0, 0, 0, 1, 0, 0x8000, 0, 0, 0] {
+            buf.write_bytes(&value.to_le_bytes())?;
+        }
+
+        Ok(())
+    }
+
+    fn write_sql_bytes_with_length(
+        buf: &mut WriteBuffer,
+        caps: &Capabilities,
+        sql: &[u8],
+    ) -> Result<()> {
+        if caps.ttc_field_version > ccap_value::FIELD_VERSION_11_2 {
+            return buf.write_bytes_with_length(Some(sql));
+        }
+
+        Self::write_legacy_11g_sql_bytes_with_length(buf, sql)
+    }
+
+    fn write_legacy_11g_sql_bytes_with_length(buf: &mut WriteBuffer, sql: &[u8]) -> Result<()> {
+        if sql.is_empty() {
+            return buf.write_u8(0);
+        }
+
+        if sql.len() <= length::MAX_SHORT as usize {
+            buf.write_u8(sql.len() as u8)?;
+            return buf.write_bytes(sql);
+        }
+
+        buf.write_u8(length::LONG_INDICATOR)?;
+        for chunk in sql.chunks(length::MAX_SHORT as usize) {
+            buf.write_u8(chunk.len() as u8)?;
+            buf.write_bytes(chunk)?;
+        }
+        buf.write_u8(0)
+    }
+
+    fn write_legacy_11g_fetch_message(
+        &self,
+        buf: &mut WriteBuffer,
+        exec_opts: u32,
+        caps: &Capabilities,
+    ) -> Result<()> {
+        let stmt = self.statement;
+        let opts = &self.options;
+
+        buf.write_u8(MessageType::Function as u8)?;
+        buf.write_u8(self.function_code as u8)?;
+        buf.write_u8(self.sequence_number)?;
+
+        buf.write_ub4(exec_opts)?;
+        buf.write_ub2(stmt.cursor_id())?;
+        buf.write_u8(0)?; // existing cursor
+        buf.write_u8(0)?; // no SQL length when parse=false
+        buf.write_u8(1)?; // al8i4 pointer
+        buf.write_ub2(13)?;
+        buf.write_u8(0)?; // al8o4 pointer
+        buf.write_u8(0)?; // al8o4l pointer
+        buf.write_u8(0)?; // no parse-time fetch count pointer
+        buf.write_u8(0)?; // no parse-time fetch count
+        buf.write_ub4(MAX_LONG_LENGTH)?;
+        buf.write_u8(0)?; // no binds pointer
+        buf.write_u8(0)?; // no binds count
+        buf.write_u8(0)?; // al8app
+        buf.write_u8(0)?; // al8txn
+        buf.write_u8(0)?; // al8txl
+        buf.write_u8(0)?; // al8kv
+        buf.write_u8(0)?; // al8kvl
+        buf.write_u8(0)?; // no define pointer
+        buf.write_u8(0)?; // no define count
+
+        buf.write_u8(0)?;
+        buf.write_u8(0)?;
+        buf.write_u8(1)?;
+
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_11_2 {
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+        }
+
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+        }
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_2 {
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+        }
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_18_1 {
+            buf.write_u8(0)?;
+            buf.write_u8(0)?;
+        }
+
+        buf.write_ub4(0)?; // al8i4[0] parse
+        buf.write_ub4(opts.prefetch_rows)?; // al8i4[1] fetch size
+        buf.write_ub4(0)?; // al8i4[2]
+        buf.write_ub4(0)?; // al8i4[3]
+        buf.write_ub4(0)?; // al8i4[4]
+        buf.write_ub4(0)?; // al8i4[5]
+        buf.write_ub4(0)?; // al8i4[6]
+        buf.write_ub4(1)?; // al8i4[7] query
+        buf.write_ub4(0)?; // al8i4[8]
+        buf.write_ub4(0)?; // al8i4[9]
+        buf.write_ub4(0)?; // al8i4[10]
+        buf.write_ub4(0)?; // al8i4[11]
+        buf.write_ub4(0)?; // al8i4[12]
 
         Ok(())
     }
@@ -524,7 +766,13 @@ impl<'a> ExecuteMessage<'a> {
             buf.write_u8(0)?; // Scale (always 0 for defines)
             buf.write_ub4(buffer_size)?; // Buffer size
             buf.write_ub4(0)?; // Max num elements (0 for non-arrays)
-            buf.write_ub8(cont_flag)?; // Cont flag (LOB prefetch flag)
+                               // Oracle 11g (TTCVersion < 10) uses UB4 for ContFlag;
+                               // 12c+ uses UB8.
+            if caps.ttc_field_version >= ccap_value::FIELD_VERSION_18_1 {
+                buf.write_ub8(cont_flag)?;
+            } else {
+                buf.write_ub4(cont_flag as u32)?;
+            }
             buf.write_ub4(0)?; // OID (0 for non-object types)
             buf.write_ub2(0)?; // Version (0 for non-object types)
 
@@ -573,7 +821,9 @@ impl<'a> ExecuteMessage<'a> {
                 let size = match value {
                     Value::String(s) => s.len() as u32,
                     Value::Bytes(b) => b.len() as u32,
-                    Value::Json(json) => serde_json::to_string(json).map(|s| s.len() as u32).unwrap_or(100),
+                    Value::Json(json) => serde_json::to_string(json)
+                        .map(|s| s.len() as u32)
+                        .unwrap_or(100),
                     Value::Vector(vec) => (vec.dimensions() * 8) as u32, // Estimate: 8 bytes per dimension max
                     _ => 0, // Fixed-size types don't need max calculation
                 };
@@ -586,37 +836,48 @@ impl<'a> ExecuteMessage<'a> {
         // Write metadata for each bind parameter
         for (col_idx, value) in first_row.iter().enumerate() {
             // Use explicit metadata if provided, otherwise infer from value
-            let (oracle_type, buffer_size, csfrm, cont_flag) = if let Some(ref metadata) = self.bind_metadata {
-                // Use explicit metadata (for PL/SQL OUT params)
-                if col_idx < metadata.len() {
-                    let meta = &metadata[col_idx];
-                    let csfrm = match meta.oracle_type {
-                        OracleType::Varchar | OracleType::Char | OracleType::Long |
-                        OracleType::Clob | OracleType::Json => 1u8,
-                        _ => 0u8,
-                    };
-                    let cont_flag = match meta.oracle_type {
-                        OracleType::Clob | OracleType::Blob | OracleType::Json | OracleType::Vector => LOB_PREFETCH_FLAG,
-                        _ => 0u64,
-                    };
-                    (meta.oracle_type, meta.buffer_size, csfrm, cont_flag)
+            let (oracle_type, buffer_size, csfrm, cont_flag) =
+                if let Some(ref metadata) = self.bind_metadata {
+                    // Use explicit metadata (for PL/SQL OUT params)
+                    if col_idx < metadata.len() {
+                        let meta = &metadata[col_idx];
+                        let csfrm = match meta.oracle_type {
+                            OracleType::Varchar
+                            | OracleType::Char
+                            | OracleType::Long
+                            | OracleType::Clob
+                            | OracleType::Json => 1u8,
+                            _ => 0u8,
+                        };
+                        let cont_flag = match meta.oracle_type {
+                            OracleType::Clob
+                            | OracleType::Blob
+                            | OracleType::Json
+                            | OracleType::Vector => LOB_PREFETCH_FLAG,
+                            _ => 0u64,
+                        };
+                        (meta.oracle_type, meta.buffer_size, csfrm, cont_flag)
+                    } else {
+                        // Fallback to inference if metadata list is too short
+                        self.infer_bind_metadata(value, max_sizes[col_idx])
+                    }
                 } else {
-                    // Fallback to inference if metadata list is too short
+                    // Infer from value
                     self.infer_bind_metadata(value, max_sizes[col_idx])
-                }
-            } else {
-                // Infer from value
-                self.infer_bind_metadata(value, max_sizes[col_idx])
-            };
+                };
 
             // Write bind metadata (oraub8 format per Python reference)
-            buf.write_u8(oracle_type as u8)?;           // Data type (byte 0)
-            buf.write_u8(bind_flags::USE_INDICATORS)?;  // Flags (byte 1)
-            buf.write_u8(0)?;                           // Precision (byte 2) - always 0
-            buf.write_u8(0)?;                           // Scale (byte 3) - always 0
-            buf.write_ub4(buffer_size)?;                // Buffer size (bytes 4-7)
-            buf.write_ub4(0)?;                          // Max num elements (bytes 8-11)
-            buf.write_ub8(cont_flag)?;                  // Cont flag (bytes 12-19)
+            buf.write_u8(oracle_type as u8)?; // Data type (byte 0)
+            buf.write_u8(bind_flags::USE_INDICATORS)?; // Flags (byte 1)
+            buf.write_u8(0)?; // Precision (byte 2) - always 0
+            buf.write_u8(0)?; // Scale (byte 3) - always 0
+            buf.write_ub4(buffer_size)?; // Buffer size (bytes 4-7)
+            buf.write_ub4(0)?; // Max num elements (bytes 8-11)
+            if caps.ttc_field_version >= ccap_value::FIELD_VERSION_18_1 {
+                buf.write_ub8(cont_flag)?;
+            } else {
+                buf.write_ub4(cont_flag as u32)?;
+            }
 
             // For Object types, write OID + version differently per Python base.pyx:1388-1395
             // Object types write: ub4(oid_len) + bytes_with_length(oid) + ub4(version)
@@ -632,32 +893,32 @@ impl<'a> ExecuteMessage<'a> {
 
                 if let Some(oid) = type_oid {
                     // Write the type OID
-                    buf.write_ub4(oid.len() as u32)?;       // OID length
-                    buf.write_bytes_with_length(Some(oid))?;  // OID bytes with length
-                    buf.write_ub4(0)?;                      // Version (ub4 for objects)
+                    buf.write_ub4(oid.len() as u32)?; // OID length
+                    buf.write_bytes_with_length(Some(oid))?; // OID bytes with length
+                    buf.write_ub4(0)?; // Version (ub4 for objects)
                 } else {
                     // No OID available - write zeros
-                    buf.write_ub4(0)?;                      // OID length = 0
-                    buf.write_ub4(0)?;                      // Version (ub4 for objects)
+                    buf.write_ub4(0)?; // OID length = 0
+                    buf.write_ub4(0)?; // Version (ub4 for objects)
                 }
             } else {
-                buf.write_ub4(0)?;                          // OID length (bytes 20-23)
-                buf.write_ub2(0)?;                          // Version (bytes 24-25)
+                buf.write_ub4(0)?; // OID length (bytes 20-23)
+                buf.write_ub2(0)?; // Version (bytes 24-25)
             }
 
             // Charset ID - UTF8 if character data (csfrm != 0)
             if csfrm != 0 {
-                buf.write_ub2(charset::UTF8)?;          // Charset ID (bytes 26-27)
+                buf.write_ub2(charset::UTF8)?; // Charset ID (bytes 26-27)
             } else {
                 buf.write_ub2(0)?;
             }
 
-            buf.write_u8(csfrm)?;                       // Character set form (byte 28)
-            buf.write_ub4(0)?;                          // LOB prefetch length (bytes 29-32)
+            buf.write_u8(csfrm)?; // Character set form (byte 28)
+            buf.write_ub4(0)?; // LOB prefetch length (bytes 29-32)
 
             // oaccolid for TTC field version >= 12.2
             if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_2 {
-                buf.write_ub4(0)?;                      // oaccolid (bytes 33-36)
+                buf.write_ub4(0)?; // oaccolid (bytes 33-36)
             }
         }
 
@@ -707,7 +968,11 @@ impl<'a> ExecuteMessage<'a> {
                 };
                 // LOBs use cont_flag = LOB_PREFETCH_FLAG
                 // buffer_size = buffer_size_factor (112 for CLOB, 112 for BLOB)
-                let csfrm = if oracle_type == OracleType::Blob { 0 } else { 1 };
+                let csfrm = if oracle_type == OracleType::Blob {
+                    0
+                } else {
+                    1
+                };
                 (oracle_type, 112, csfrm, LOB_PREFETCH_FLAG)
             }
             Value::Json(_) => {
@@ -851,20 +1116,22 @@ impl<'a> ExecuteMessage<'a> {
                         const LOB_LOC_FLAGS_ABSTRACT: u8 = 0x40;
                         const LOB_LOC_FLAGS_INIT: u8 = 0x08;
 
-                        buf.write_ub4(QLOCATOR_LEN)?;           // QLocator length
-                        buf.write_u8(QLOCATOR_LEN as u8)?;      // Chunk length
-                        buf.write_u16_be(38)?;                  // Length - 2
-                        buf.write_u16_be(QLOCATOR_VERSION)?;    // Version
-                        buf.write_u8(LOB_LOC_FLAGS_VALUE_BASED | LOB_LOC_FLAGS_BLOB | LOB_LOC_FLAGS_ABSTRACT)?;
-                        buf.write_u8(LOB_LOC_FLAGS_INIT)?;      // Flags
-                        buf.write_u16_be(0)?;                   // Additional flags
-                        buf.write_u16_be(1)?;                   // byt1
-                        buf.write_u64_be(data_len)?;            // Data length
-                        buf.write_u16_be(0)?;                   // Unused
-                        buf.write_u16_be(0)?;                   // csid
-                        buf.write_u16_be(0)?;                   // Unused
-                        buf.write_u64_be(0)?;                   // Unused
-                        buf.write_u64_be(0)?;                   // Unused
+                        buf.write_ub4(QLOCATOR_LEN)?; // QLocator length
+                        buf.write_u8(QLOCATOR_LEN as u8)?; // Chunk length
+                        buf.write_u16_be(38)?; // Length - 2
+                        buf.write_u16_be(QLOCATOR_VERSION)?; // Version
+                        buf.write_u8(
+                            LOB_LOC_FLAGS_VALUE_BASED | LOB_LOC_FLAGS_BLOB | LOB_LOC_FLAGS_ABSTRACT,
+                        )?;
+                        buf.write_u8(LOB_LOC_FLAGS_INIT)?; // Flags
+                        buf.write_u16_be(0)?; // Additional flags
+                        buf.write_u16_be(1)?; // byt1
+                        buf.write_u64_be(data_len)?; // Data length
+                        buf.write_u16_be(0)?; // Unused
+                        buf.write_u16_be(0)?; // csid
+                        buf.write_u16_be(0)?; // Unused
+                        buf.write_u64_be(0)?; // Unused
+                        buf.write_u64_be(0)?; // Unused
 
                         // Write OSON data with chunked length prefix
                         // Per Python's write_length():
@@ -904,20 +1171,22 @@ impl<'a> ExecuteMessage<'a> {
                 const LOB_LOC_FLAGS_ABSTRACT: u8 = 0x40;
                 const LOB_LOC_FLAGS_INIT: u8 = 0x08;
 
-                buf.write_ub4(QLOCATOR_LEN)?;           // QLocator length
-                buf.write_u8(QLOCATOR_LEN as u8)?;      // Chunk length
-                buf.write_u16_be(38)?;                  // Length - 2
-                buf.write_u16_be(QLOCATOR_VERSION)?;    // Version
-                buf.write_u8(LOB_LOC_FLAGS_VALUE_BASED | LOB_LOC_FLAGS_BLOB | LOB_LOC_FLAGS_ABSTRACT)?;
-                buf.write_u8(LOB_LOC_FLAGS_INIT)?;      // Flags
-                buf.write_u16_be(0)?;                   // Additional flags
-                buf.write_u16_be(1)?;                   // byt1
-                buf.write_u64_be(data_len)?;            // Data length
-                buf.write_u16_be(0)?;                   // Unused
-                buf.write_u16_be(0)?;                   // csid
-                buf.write_u16_be(0)?;                   // Unused
-                buf.write_u64_be(0)?;                   // Unused
-                buf.write_u64_be(0)?;                   // Unused
+                buf.write_ub4(QLOCATOR_LEN)?; // QLocator length
+                buf.write_u8(QLOCATOR_LEN as u8)?; // Chunk length
+                buf.write_u16_be(38)?; // Length - 2
+                buf.write_u16_be(QLOCATOR_VERSION)?; // Version
+                buf.write_u8(
+                    LOB_LOC_FLAGS_VALUE_BASED | LOB_LOC_FLAGS_BLOB | LOB_LOC_FLAGS_ABSTRACT,
+                )?;
+                buf.write_u8(LOB_LOC_FLAGS_INIT)?; // Flags
+                buf.write_u16_be(0)?; // Additional flags
+                buf.write_u16_be(1)?; // byt1
+                buf.write_u64_be(data_len)?; // Data length
+                buf.write_u16_be(0)?; // Unused
+                buf.write_u16_be(0)?; // csid
+                buf.write_u16_be(0)?; // Unused
+                buf.write_u64_be(0)?; // Unused
+                buf.write_u64_be(0)?; // Unused
 
                 // Write vector data with chunked length prefix
                 let vec_len = vector_bytes.len();
@@ -952,12 +1221,13 @@ impl<'a> ExecuteMessage<'a> {
                 // Per Python base.pyx lines 1431-1437
                 if collection.elements.is_empty() {
                     // NULL/OUT param format for objects
-                    buf.write_ub4(0)?;  // TOID length
-                    buf.write_ub4(0)?;  // OID length
-                    buf.write_ub4(0)?;  // snapshot length
-                    buf.write_ub2(0)?;  // version
-                    buf.write_ub4(0)?;  // packed data length
-                    buf.write_ub4(crate::constants::obj_flags::TOP_LEVEL as u32)?;  // flags
+                    buf.write_ub4(0)?; // TOID length
+                    buf.write_ub4(0)?; // OID length
+                    buf.write_ub4(0)?; // snapshot length
+                    buf.write_ub2(0)?; // version
+                    buf.write_ub4(0)?; // packed data length
+                    buf.write_ub4(crate::constants::obj_flags::TOP_LEVEL as u32)?;
+                // flags
                 } else {
                     // IN param with actual data - encode as full object wire format
                     // Per Python packet.pyx write_dbobject() lines 873-893
@@ -988,25 +1258,32 @@ impl<'a> ExecuteMessage<'a> {
         use crate::types::encode_collection;
 
         // Extract type metadata from the collection
-        let type_oid = collection.get("_type_oid")
+        let type_oid = collection
+            .get("_type_oid")
             .and_then(|v| v.as_bytes())
-            .ok_or_else(|| crate::error::Error::Protocol(
-                "Collection missing type OID for IN binding".to_string()
-            ))?;
+            .ok_or_else(|| {
+                crate::error::Error::Protocol(
+                    "Collection missing type OID for IN binding".to_string(),
+                )
+            })?;
 
-        let schema = collection.get("_type_schema")
+        let schema = collection
+            .get("_type_schema")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let name = collection.get("_type_name")
+        let name = collection
+            .get("_type_name")
             .and_then(|v| v.as_str())
             .unwrap_or("");
 
-        let element_type_code = collection.get("_element_type")
+        let element_type_code = collection
+            .get("_element_type")
             .and_then(|v| v.as_i64())
             .and_then(|c| crate::constants::OracleType::try_from(c as u8).ok())
             .unwrap_or(crate::constants::OracleType::Varchar);
 
-        let coll_type_code = collection.get("_collection_type")
+        let coll_type_code = collection
+            .get("_collection_type")
             .and_then(|v| v.as_i64())
             .unwrap_or(3); // Default to VARRAY
 
@@ -1177,6 +1454,68 @@ mod tests {
         assert_eq!(msg.function_code(), FunctionCode::Execute);
     }
 
+    #[test]
+    fn test_legacy_11g_dml_row_counts_flag_not_advertised() {
+        let stmt = Statement::new("UPDATE test_table SET value = 1");
+        let mut opts = ExecuteOptions::for_dml(false);
+        opts.dml_row_counts = true;
+        let msg = ExecuteMessage::new(&stmt, opts);
+
+        let mut caps = Capabilities::new();
+        caps.protocol_version = 314;
+        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+
+        let packet = msg.build_request(&caps).unwrap();
+        let encoded_flag = [0x02, 0x40, 0x00];
+
+        assert!(
+            !packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
+            "Oracle 11g execute packets must not advertise DML row-count flags"
+        );
+    }
+
+    #[test]
+    fn test_legacy_11g_query_packet_matches_pcap() {
+        let stmt = Statement::new("SELECT 1 FROM DUAL");
+        let opts = ExecuteOptions::for_query(100);
+        let mut msg = ExecuteMessage::new(&stmt, opts);
+        msg.set_sequence_number(6);
+
+        let mut caps = Capabilities::new();
+        caps.protocol_version = 314;
+        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+
+        let packet = msg.build_request(&caps).unwrap();
+        let hex = hex::encode(packet.as_ref());
+
+        let expected = "01000000060000002000035e066180000000000000feffffffffffffff12000000feffffffffffffff0d000000fefffffffffffffffeffffffffffffff0000000002000000000000000000000000000000000000000000000000000000feffffffffffffff0000000000000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffeffffffffffffff000000000000000000000000000000000000000000000000000000001253454c45435420312046524f4d204455414c01000000000000000000000000000000000000000000000000000000010000000000000000800000000000000000000000000000";
+
+        assert_eq!(hex, expected);
+    }
+
+    #[test]
+    fn test_legacy_11g_long_sql_uses_short_chunks() {
+        let mut caps = Capabilities::new();
+        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+        let sql = vec![b'a'; length::MAX_SHORT as usize + 48];
+        let mut buf = WriteBuffer::new();
+
+        ExecuteMessage::write_sql_bytes_with_length(&mut buf, &caps, &sql).unwrap();
+        let encoded = buf.as_slice();
+
+        assert_eq!(encoded[0], length::LONG_INDICATOR);
+        assert_eq!(encoded[1], length::MAX_SHORT);
+        assert_eq!(&encoded[2..2 + length::MAX_SHORT as usize], &sql[..length::MAX_SHORT as usize]);
+
+        let second_chunk_pos = 2 + length::MAX_SHORT as usize;
+        assert_eq!(encoded[second_chunk_pos], 48);
+        assert_eq!(
+            &encoded[second_chunk_pos + 1..second_chunk_pos + 49],
+            &sql[length::MAX_SHORT as usize..]
+        );
+        assert_eq!(encoded[second_chunk_pos + 49], 0);
+    }
+
     // =========================================================================
     // WIRE-LEVEL PROTOCOL TESTS
     // These tests document specific protocol details learned during development.
@@ -1202,17 +1541,17 @@ mod tests {
 
         // Simulate a type_oid (16 bytes) as returned from database
         let type_oid: [u8; 16] = [
-            0x45, 0xFC, 0x24, 0x2B, 0xB8, 0xC9, 0x46, 0x3B,
-            0xE0, 0x63, 0x05, 0x00, 0x11, 0xAC, 0x97, 0x82,
+            0x45, 0xFC, 0x24, 0x2B, 0xB8, 0xC9, 0x46, 0x3B, 0xE0, 0x63, 0x05, 0x00, 0x11, 0xAC,
+            0x97, 0x82,
         ];
 
         // Build TOID as we do in write_collection_with_data
         let mut toid = Vec::with_capacity(36);
-        toid.extend_from_slice(&obj_flags::TOID_PREFIX);  // [0x00, 0x22]
-        toid.push(obj_flags::NON_NULL_OID);               // 0x02
-        toid.push(obj_flags::HAS_EXTENT_OID);             // 0x08
-        toid.extend_from_slice(&type_oid);                // 16 bytes
-        toid.extend_from_slice(&obj_flags::EXTENT_OID);   // 16 bytes
+        toid.extend_from_slice(&obj_flags::TOID_PREFIX); // [0x00, 0x22]
+        toid.push(obj_flags::NON_NULL_OID); // 0x02
+        toid.push(obj_flags::HAS_EXTENT_OID); // 0x08
+        toid.extend_from_slice(&type_oid); // 16 bytes
+        toid.extend_from_slice(&obj_flags::EXTENT_OID); // 16 bytes
 
         // Verify structure
         assert_eq!(toid.len(), 36, "TOID must be exactly 36 bytes");
@@ -1254,7 +1593,7 @@ mod tests {
         // Object format: ub4(oid_len) + bytes_with_length(oid) + ub4(version)
         obj_meta.write_ub4(oid.len() as u32).unwrap();
         obj_meta.write_bytes_with_length(Some(&oid)).unwrap();
-        obj_meta.write_ub4(0).unwrap();  // version as ub4
+        obj_meta.write_ub4(0).unwrap(); // version as ub4
 
         // Scalar format (for comparison): ub4(0) + ub2(0)
         let mut scalar_meta = WriteBuffer::new();
@@ -1262,8 +1601,10 @@ mod tests {
         scalar_meta.write_ub2(0).unwrap();
 
         // Object metadata is longer due to OID + ub4 version
-        assert!(obj_meta.len() > scalar_meta.len(),
-            "Object bind metadata includes OID and uses ub4 for version");
+        assert!(
+            obj_meta.len() > scalar_meta.len(),
+            "Object bind metadata includes OID and uses ub4 for version"
+        );
 
         // CRITICAL: TNS variable-length encoding means ub4(0) and ub2(0) each write 1 byte!
         // - write_ub4(0) = 0x00 (single byte)
@@ -1272,6 +1613,10 @@ mod tests {
         // - write_ub4(300) = [0x02, 0x01, 0x2C] (3 bytes)
         // - write_ub2(300) = [0x02, 0x01, 0x2C] (3 bytes) - same for values up to 65535
         // But for values > 65535, ub4 would use 4 bytes while ub2 would overflow
-        assert_eq!(scalar_meta.len(), 2, "Scalar: ub4(0) + ub2(0) = 2 bytes (variable-length encoding)");
+        assert_eq!(
+            scalar_meta.len(),
+            2,
+            "Scalar: ub4(0) + ub2(0) = 2 bytes (variable-length encoding)"
+        );
     }
 }

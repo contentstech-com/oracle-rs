@@ -98,7 +98,8 @@ mod protocol_message_tests {
     #[test]
     fn test_protocol_request_structure() {
         let msg = ProtocolMessage::new();
-        let packet = msg.build_request(false).unwrap();
+        let caps = Capabilities::new();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Verify packet header
         assert!(packet.len() > PACKET_HEADER_SIZE);
@@ -277,7 +278,7 @@ mod capabilities_negotiation_flow {
 
         // Step 2: Build and send Protocol request
         let proto_msg = ProtocolMessage::new();
-        let proto_request = proto_msg.build_request(false).unwrap();
+        let proto_request = proto_msg.build_request(&caps, false).unwrap();
         assert!(!proto_request.is_empty());
 
         // Step 3: Parse Protocol response from server
@@ -419,7 +420,8 @@ mod packet_header_integration {
     #[test]
     fn test_protocol_packet_header_validation() {
         let msg = ProtocolMessage::new();
-        let packet = msg.build_request(false).unwrap();
+        let caps = Capabilities::new();
+        let packet = msg.build_request(&caps, false).unwrap();
 
         // Parse the header back
         let header = PacketHeader::parse(&packet).unwrap();

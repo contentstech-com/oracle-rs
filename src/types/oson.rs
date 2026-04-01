@@ -830,6 +830,7 @@ impl OsonEncoder {
     /// - hash_ids: 1 byte hash per field name
     /// - offsets: 2 byte BE offset per field name (into names_data)
     /// - names_data: length-prefixed field name strings
+    ///
     /// Note: field_names must already be sorted by sort_and_update_field_ids
     fn build_field_names_components(&self) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let mut hash_ids = Vec::new();

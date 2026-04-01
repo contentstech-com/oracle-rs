@@ -661,7 +661,7 @@ impl<'a> RowDataDecoder<'a> {
         let block_num = buf.read_ub4()?;
         let slot_num = buf.read_ub2()?;
 
-        let rowid = RowId::new(rba, partition_id as u16, block_num, slot_num as u16);
+        let rowid = RowId::new(rba, partition_id, block_num, slot_num);
         Ok(Value::RowId(rowid))
     }
 

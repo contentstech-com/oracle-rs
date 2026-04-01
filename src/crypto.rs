@@ -267,7 +267,7 @@ pub fn generate_12c_combo_key(
 /// The combo key is derived by XORing session key parts and hashing with MD5.
 pub fn generate_11g_combo_key(session_key_part_a: &[u8], session_key_part_b: &[u8]) -> Vec<u8> {
     // XOR bytes 16-40 from both parts
-    let mut xored = vec![0u8; 24];
+    let mut xored = [0u8; 24];
     for i in 0..24 {
         xored[i] = session_key_part_a[16 + i] ^ session_key_part_b[16 + i];
     }

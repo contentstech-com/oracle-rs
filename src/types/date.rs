@@ -124,6 +124,7 @@ impl OracleTimestamp {
     }
 
     /// Create a timestamp with timezone offset
+    #[allow(clippy::too_many_arguments)]
     pub fn with_timezone(
         year: i32,
         month: u8,
