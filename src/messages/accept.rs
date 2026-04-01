@@ -68,7 +68,8 @@ impl AcceptMessage {
         // Protocol version
         let protocol_version = buf.read_u16_be()?;
 
-        // Check minimum version
+        // Oracle 11g XE responds with TNS 314. Anything older is outside
+        // the compatibility window we want to support here.
         if protocol_version < version::MIN_ACCEPTED {
             return Err(Error::ProtocolVersionNotSupported(
                 protocol_version,
@@ -235,6 +236,34 @@ mod tests {
         assert_eq!(accept.sdu, 8192);
         assert!(!accept.supports_fast_auth); // No flags2
         assert!(accept.uses_large_sdu());
+    }
+
+    #[test]
+    fn test_parse_accept_11g_r2_from_pcap() {
+        // Payload extracted from script/oracle_tns_dump.pcap frame 11
+        let payload = [
+            0x01, 0x3A, // Protocol version: 314
+            0x0C, 0x41, // Service options
+            0x08, 0x00, // SDU: 2048
+            0xFF, 0xFF, // TDU: 65535
+            0x01, 0x00, // Hardware byte order
+            0x00, 0x00, // Data length: 0
+            0x00, 0x20, // Data offset: 32 (header-inclusive)
+            0x41, // Flags 0
+            0x41, // Flags 1
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Reserved
+        ];
+
+        let packet = make_accept_packet(&payload);
+        let accept = AcceptMessage::parse(&packet).unwrap();
+
+        assert_eq!(accept.protocol_version, 314);
+        assert_eq!(accept.service_options, 0x0C41);
+        assert_eq!(accept.sdu, 2048);
+        assert_eq!(accept.tdu, 65535);
+        assert_eq!(accept.flags, 0x41);
+        assert!(!accept.supports_fast_auth);
+        assert!(!accept.uses_large_sdu());
     }
 
     #[test]

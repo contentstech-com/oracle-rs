@@ -43,7 +43,7 @@ use crate::cursor::{ScrollableCursor, ScrollResult};
 use crate::error::{Error, Result};
 use crate::implicit::{ImplicitResult, ImplicitResults};
 use crate::messages::{AcceptMessage, AuthMessage, AuthPhase, ConnectMessage, ExecuteMessage, ExecuteOptions, FetchMessage, LobOpMessage};
-use crate::packet::Packet;
+use crate::packet::{Packet, PacketHeader};
 use crate::row::{Row, Value};
 use crate::statement::{BindParam, ColumnInfo, Statement, StatementType};
 use crate::types::{LobData, LobLocator, LobValue};
@@ -220,6 +220,8 @@ pub struct ServerInfo {
     pub session_id: u32,
     /// Serial number
     pub serial_number: u32,
+    /// Failover ID
+    pub failover_id: u32,
     /// Instance name
     pub instance_name: Option<String>,
     /// Service name
@@ -967,6 +969,11 @@ impl Connection {
                     inner.server_info.protocol_version = accept.protocol_version;
                     inner.server_info.supports_oob = accept.supports_oob;
                     inner.sdu_size = accept.sdu.min(65535) as u16;
+                    inner.capabilities.adjust_for_protocol(
+                        accept.protocol_version,
+                        accept.service_options,
+                        accept.flags2,
+                    );
 
                     inner.state = ConnectionState::Connected;
                     return Ok(());
@@ -1018,14 +1025,32 @@ impl Connection {
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
 
+        // The ACCEPT packet is the authoritative source for the negotiated
+        // TTC version. Keep capabilities in sync so the 11g-specific protocol
+        // builder is actually selected for TNS 314 sessions.
+        inner.capabilities.protocol_version = inner.server_info.protocol_version;
 
         // Build protocol request (includes header)
         let protocol_msg = ProtocolMessage::new();
-        let packet = protocol_msg.build_request(large_sdu)?;
+        let packet = protocol_msg.build_request(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs protocol request ({} bytes): {}",
+                packet.len(),
+                hex::encode(packet.as_ref())
+            );
+        }
         inner.send(&packet).await?;
 
         // Receive response
         let response = inner.receive().await?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs protocol response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
 
         // Validate packet type (at offset 4 for both SDU modes)
         if response.len() <= 4 || response[4] != PacketType::Data as u8 {
@@ -1037,6 +1062,14 @@ impl Connection {
         let payload = &response[PACKET_HEADER_SIZE..];
         let mut protocol_msg = ProtocolMessage::new();
         protocol_msg.parse_response(payload, &mut inner.capabilities)?;
+
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs ttc_field_version={} protocol_version={}",
+                inner.capabilities.ttc_field_version,
+                inner.capabilities.protocol_version,
+            );
+        }
 
         // Update server info with banner
         if let Some(banner) = &protocol_msg.server_banner {
@@ -1054,17 +1087,71 @@ impl Connection {
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
 
+        // The legacy 11g data-types payload is keyed off the negotiated TNS
+        // protocol version, so mirror the ACCEPT value here as well.
+        inner.capabilities.protocol_version = inner.server_info.protocol_version;
 
         // Build data types request using DataTypesMessage (includes all ~320 data types)
         let data_types_msg = DataTypesMessage::new();
-        let packet = data_types_msg.build_request(&inner.capabilities, large_sdu)?;
+        let (packet, continuation) =
+            data_types_msg.build_request_with_continuation(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs data-types request ({} bytes): {}",
+                packet.len(),
+                hex::encode(packet.as_ref())
+            );
+        }
         inner.send(&packet).await?;
+        if let Some(ref continuation_packet) = continuation {
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs data-types continuation request ({} bytes): {}",
+                    continuation_packet.len(),
+                    hex::encode(continuation_packet.as_ref())
+                );
+            }
+            inner.send(continuation_packet).await?;
+        }
 
         // Receive response
-        let response = inner.receive().await?;
+        let mut response = inner.receive().await?;
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs data-types response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
+
+        if continuation.is_some()
+            && response.len() > PACKET_HEADER_SIZE
+            && response[4] == PacketType::Data as u8
+        {
+            let payload = &response[PACKET_HEADER_SIZE..];
+            if matches!(
+                data_types_msg.parse_response(payload),
+                Err(Error::BufferUnderflow { .. })
+            ) {
+                let continuation_response = inner.receive().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                    eprintln!(
+                        "oracle-rs data-types continuation response ({} bytes): {}",
+                        continuation_response.len(),
+                        hex::encode(continuation_response.as_ref())
+                    );
+                }
+                response = Self::combine_data_packets(
+                    response.as_ref(),
+                    continuation_response.as_ref(),
+                    large_sdu,
+                )?;
+            }
+        }
 
         // Basic validation - packet type is at offset 4 regardless of large_sdu
         if response.len() > 4 && response[4] == PacketType::Data as u8 {
+            data_types_msg.parse_response(&response[PACKET_HEADER_SIZE..])?;
             inner.state = ConnectionState::DataTypesNegotiated;
             Ok(())
         } else {
@@ -1085,17 +1172,51 @@ impl Connection {
             self.config.password().as_bytes(),
             &service_name,
         );
+        auth.set_connect_descriptor_info(
+            &self.config.host,
+            self.config.port,
+            matches!(self.config.service, ServiceMethod::Sid(_)),
+        );
 
         // Phase one: send username and session info
         {
             let mut inner = self.inner.lock().await;
             let large_sdu = inner.large_sdu;
             let request = auth.build_request(&inner.capabilities, large_sdu)?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase1 request ({} bytes): {}",
+                    request.len(),
+                    hex::encode(request.as_ref())
+                );
+            }
             inner.send(&request).await?;
 
             let response = inner.receive().await?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase1 response ({} bytes): {}",
+                    response.len(),
+                    hex::encode(response.as_ref())
+                );
+            }
             if response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty auth response".to_string()));
+            }
+
+            let packet_type = response[4];
+            if packet_type == PacketType::Marker as u8 {
+                let error_response = inner.handle_marker_reset().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                    eprintln!(
+                        "oracle-rs auth phase1 marker status ({} bytes): {}",
+                        error_response.len(),
+                        hex::encode(error_response.as_ref())
+                    );
+                }
+                let error_text = Self::extract_embedded_server_error(error_response.as_ref())
+                    .unwrap_or_else(|| "server rejected authentication phase one".to_string());
+                return Err(Error::AuthenticationFailed(error_text));
             }
 
             // Check for error message type
@@ -1116,18 +1237,41 @@ impl Connection {
             let mut inner = self.inner.lock().await;
             let large_sdu = inner.large_sdu;
             let request = auth.build_request(&inner.capabilities, large_sdu)?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase2 request ({} bytes): {}",
+                    request.len(),
+                    hex::encode(request.as_ref())
+                );
+            }
             inner.send(&request).await?;
 
             let response = inner.receive().await?;
+            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                eprintln!(
+                    "oracle-rs auth phase2 response ({} bytes): {}",
+                    response.len(),
+                    hex::encode(response.as_ref())
+                );
+            }
             if response.len() <= PACKET_HEADER_SIZE {
                 return Err(Error::Protocol("Empty auth phase two response".to_string()));
             }
 
             // Check for error message type or marker
             let packet_type = response[4];
-            if packet_type == 12 {
-                // Marker - authentication failed
-                return Err(Error::AuthenticationFailed("Server sent MARKER - authentication rejected".to_string()));
+            if packet_type == PacketType::Marker as u8 {
+                let error_response = inner.handle_marker_reset().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+                    eprintln!(
+                        "oracle-rs auth phase2 marker status ({} bytes): {}",
+                        error_response.len(),
+                        hex::encode(error_response.as_ref())
+                    );
+                }
+                let error_text = Self::extract_embedded_server_error(error_response.as_ref())
+                    .unwrap_or_else(|| "server rejected authentication phase two".to_string());
+                return Err(Error::AuthenticationFailed(error_text));
             }
 
             if response.len() > PACKET_HEADER_SIZE + 2 {
@@ -1147,16 +1291,150 @@ impl Connection {
             ));
         }
 
+        let session_identifiers = auth.session_identifiers();
+
         // Store combo key for later use (encrypted data)
         let mut inner = self.inner.lock().await;
         if let Some(combo_key) = auth.combo_key() {
             inner.capabilities.combo_key = Some(combo_key.to_vec());
         }
-        // Auth used sequence numbers 1 and 2, set to 2 so next is 3
-        inner.sequence_number = 2;
+        if let Some((session_id, serial_number, failover_id)) = session_identifiers {
+            inner.server_info.session_id = session_id;
+            inner.server_info.serial_number = serial_number;
+            inner.server_info.failover_id = failover_id;
+        }
+        let enable_legacy_11g_sequence_alignment = inner.server_info.protocol_version == 314
+            && (std::env::var_os("ORACLE_RS_SEND_11G_SESSION_SWITCH").is_some()
+                || std::env::var_os("ORACLE_RS_WRAP_11G_EXECUTE").is_some());
+        // Allow targeted 11g sequencing experiments without changing the
+        // normal state machine for other servers.
+        inner.sequence_number = std::env::var("ORACLE_RS_POST_AUTH_SEQUENCE")
+            .ok()
+            .and_then(|raw| raw.parse::<u8>().ok())
+            .unwrap_or(if enable_legacy_11g_sequence_alignment { 4 } else { 2 });
+        if inner.server_info.protocol_version == 314
+            && std::env::var_os("ORACLE_RS_SEND_11G_SESSION_SWITCH").is_some()
+        {
+            let (session_id, serial_number, failover_id) = session_identifiers.ok_or_else(|| {
+                Error::Protocol("missing 11g session identifiers for session switch".to_string())
+            })?;
+            Self::send_legacy_11g_session_switch(
+                &mut inner,
+                session_id,
+                serial_number,
+                failover_id,
+            )
+            .await?;
+        }
+
         inner.state = ConnectionState::Ready;
 
         Ok(())
+    }
+
+    async fn send_legacy_11g_session_switch(
+        inner: &mut ConnectionInner,
+        session_id: u32,
+        serial_number: u32,
+        failover_id: u32,
+    ) -> Result<()> {
+        let seq_num = std::env::var("ORACLE_RS_11G_SESSION_SWITCH_SEQUENCE")
+            .ok()
+            .and_then(|raw| raw.parse::<u8>().ok())
+            .unwrap_or_else(|| inner.next_sequence_number());
+
+        let mut packet = WriteBuffer::with_capacity(PACKET_HEADER_SIZE + 48);
+        if inner.large_sdu {
+            packet.write_u32_be((PACKET_HEADER_SIZE + 48) as u32)?;
+        } else {
+            packet.write_u16_be((PACKET_HEADER_SIZE + 48) as u16)?;
+            packet.write_u16_be(0)?;
+        }
+        packet.write_u8(PacketType::Data as u8)?;
+        packet.write_u8(0)?;
+        packet.write_u16_be(0)?;
+        packet.write_u16_be(0x2000)?;
+        packet.write_u8(0x11)?;
+        packet.write_u8(0x6b)?;
+        packet.write_u8(0x04)?;
+        packet.write_bytes(&session_id.to_le_bytes())?;
+        packet.write_bytes(&serial_number.to_le_bytes())?;
+        packet.write_bytes(&failover_id.to_le_bytes())?;
+        packet.write_u8(0x03)?;
+        packet.write_u8(0x3b)?;
+        packet.write_u8(seq_num)?;
+        packet.write_bytes(&(-2i64).to_le_bytes())?;
+        packet.write_bytes(&512u32.to_le_bytes())?;
+        packet.write_bytes(&(-2i64).to_le_bytes())?;
+        packet.write_bytes(&(-2i64).to_le_bytes())?;
+        let packet = packet.freeze();
+
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs 11g session-switch request ({} bytes): {}",
+                packet.len(),
+                hex::encode(packet.as_ref())
+            );
+        }
+
+        inner.send(&packet).await?;
+        let response = inner.receive().await?;
+
+        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
+            eprintln!(
+                "oracle-rs 11g session-switch response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
+
+        if response.len() > 4 && response[4] == 12 {
+            return Err(Error::Protocol(
+                "legacy 11g session-switch piggyback was rejected".to_string(),
+            ));
+        }
+
+        inner.sequence_number = seq_num;
+
+        Ok(())
+    }
+
+    fn wrap_legacy_11g_execute_request(
+        inner: &ConnectionInner,
+        request: &[u8],
+        session_id: u32,
+        serial_number: u32,
+        failover_id: u32,
+    ) -> Result<Bytes> {
+        if request.len() <= PACKET_HEADER_SIZE + 2 {
+            return Err(Error::Protocol(
+                "Oracle 11g wrapped execute request is too short".to_string(),
+            ));
+        }
+
+        let inner_payload = &request[PACKET_HEADER_SIZE + 2..];
+        let total_len = PACKET_HEADER_SIZE + 2 + 1 + 1 + 1 + 4 + 4 + 4 + inner_payload.len();
+        let mut packet = WriteBuffer::with_capacity(total_len);
+
+        if inner.large_sdu {
+            packet.write_u32_be(total_len as u32)?;
+        } else {
+            packet.write_u16_be(total_len as u16)?;
+            packet.write_u16_be(0)?;
+        }
+        packet.write_u8(PacketType::Data as u8)?;
+        packet.write_u8(0)?;
+        packet.write_u16_be(0)?;
+        packet.write_u16_be(0x2000)?;
+        packet.write_u8(0x11)?;
+        packet.write_u8(0x6b)?;
+        packet.write_u8(0x04)?;
+        packet.write_bytes(&session_id.to_le_bytes())?;
+        packet.write_bytes(&serial_number.to_le_bytes())?;
+        packet.write_bytes(&failover_id.to_le_bytes())?;
+        packet.write_bytes(inner_payload)?;
+
+        Ok(packet.freeze())
     }
 
     /// Execute a SQL statement and return the result
@@ -1496,6 +1774,13 @@ impl Connection {
         let seq_num = inner.next_sequence_number();
         execute_msg.set_sequence_number(seq_num);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
         // Receive response
@@ -1571,6 +1856,13 @@ impl Connection {
         let seq_num = inner.next_sequence_number();
         execute_msg.set_sequence_number(seq_num);
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
         // Receive response
@@ -1588,9 +1880,15 @@ impl Connection {
 
         // Parse the batch response
         let payload = &response[PACKET_HEADER_SIZE..];
+        let ttc_field_version = inner.capabilities.ttc_field_version;
         drop(inner); // Release lock before parsing
 
-        self.parse_batch_response(payload, batch.rows.len(), batch.options.array_dml_row_counts)
+        self.parse_batch_response(
+            payload,
+            batch.rows.len(),
+            batch.options.array_dml_row_counts,
+            ttc_field_version,
+        )
     }
 
     /// Handle MARKER packet protocol (BREAK/RESET)
@@ -1673,6 +1971,7 @@ impl Connection {
         payload: &[u8],
         batch_size: usize,
         want_row_counts: bool,
+        ttc_field_version: u8,
     ) -> Result<BatchResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("Batch response too short".to_string()));
@@ -1694,7 +1993,8 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, row_count) =
+                        self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
                         return Err(Error::OracleError {
@@ -1872,6 +2172,13 @@ impl Connection {
         execute_msg.set_sequence_number(seq_num);
 
         let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
         // Receive and parse response
@@ -2406,7 +2713,31 @@ impl Connection {
         let large_sdu = inner.large_sdu;
         let seq_num = inner.next_sequence_number();
         execute_msg.set_sequence_number(seq_num);
-        let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        let mut request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
+        if inner.server_info.protocol_version == 314
+            && std::env::var_os("ORACLE_RS_WRAP_11G_EXECUTE").is_some()
+            && statement.cursor_id() == 0
+        {
+            if inner.server_info.session_id == 0 || inner.server_info.serial_number == 0 {
+                return Err(Error::Protocol(
+                    "Oracle 11g wrapped execute requires session identifiers".to_string(),
+                ));
+            }
+            request = Self::wrap_legacy_11g_execute_request(
+                &inner,
+                request.as_ref(),
+                inner.server_info.session_id,
+                inner.server_info.serial_number,
+                inner.server_info.failover_id,
+            )?;
+        }
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query request ({} bytes): {}",
+                request.len(),
+                hex::encode(request.as_ref())
+            );
+        }
         inner.send(&request).await?;
 
         // Receive and parse response
@@ -2415,11 +2746,26 @@ impl Connection {
             return Err(Error::Protocol("Empty query response".to_string()));
         }
 
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs query response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
+
         // Check for MARKER packet (indicates error - requires reset protocol)
         let packet_type = response[4];
         if packet_type == PacketType::Marker as u8 {
             // Handle marker reset protocol and get the error packet
             let error_response = inner.handle_marker_reset().await?;
+            if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+                eprintln!(
+                    "oracle-rs query error response ({} bytes): {}",
+                    error_response.len(),
+                    hex::encode(error_response.as_ref())
+                );
+            }
             let payload = &error_response[PACKET_HEADER_SIZE..];
             return self.parse_error_response(payload);
         }
@@ -2460,6 +2806,13 @@ impl Connection {
             let packet_type = define_response[4];
             if packet_type == PacketType::Marker as u8 {
                 let error_response = inner.handle_marker_reset().await?;
+                if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+                    eprintln!(
+                        "oracle-rs query define error response ({} bytes): {}",
+                        error_response.len(),
+                        hex::encode(error_response.as_ref())
+                    );
+                }
                 let payload = &error_response[PACKET_HEADER_SIZE..];
                 return self.parse_error_response(payload);
             }
@@ -2548,7 +2901,10 @@ impl Connection {
                             } else if pkt_type == PacketType::Data as u8 {
                                 // Got DATA packet - use this as the response (may contain error)
                                 let payload = &pkt[PACKET_HEADER_SIZE..];
-                                return self.parse_dml_response(payload);
+                                return self.parse_dml_response(
+                                    payload,
+                                    inner.capabilities.ttc_field_version,
+                                );
                             } else {
                                 break;
                             }
@@ -2611,7 +2967,7 @@ impl Connection {
 
         // Parse the response to extract rows affected (or error)
         let payload = &response[PACKET_HEADER_SIZE..];
-        self.parse_dml_response(payload)
+        self.parse_dml_response(payload, inner.capabilities.ttc_field_version)
     }
 
     /// Parse query response to extract columns and rows
@@ -2623,6 +2979,95 @@ impl Connection {
     /// - Error (4): completion status (may contain error or success)
     fn parse_query_response(&self, payload: &[u8], caps: &Capabilities) -> Result<QueryResult> {
         self.parse_query_response_with_columns(payload, caps, &[])
+    }
+
+    fn is_query_response_message_type(msg_type: u8) -> bool {
+        matches!(
+            msg_type,
+            x if x == MessageType::RowHeader as u8
+                || x == MessageType::RowData as u8
+                || x == MessageType::Error as u8
+                || x == MessageType::Status as u8
+                || x == MessageType::BitVector as u8
+                || x == MessageType::EndOfResponse as u8
+        )
+    }
+
+    fn parse_query_describe_info(
+        &self,
+        buf: &mut ReadBuffer,
+        caps: &Capabilities,
+    ) -> Result<Vec<ColumnInfo>> {
+        // The describe info response starts with a TNS chunked-encoded
+        // prefix (current date, dcb flags, etc.) followed by the column
+        // metadata.  On Oracle 12c+ the chunked prefix is small and
+        // skip_raw_bytes_chunked works.  On Oracle 11g the **entire**
+        // response (including column metadata, row data, and the error
+        // trailer) is delivered inside a single chunked stream.
+        //
+        // Strategy: read the chunked prefix.  If the next byte after the
+        // prefix is a valid query-response message type we are done.
+        // Otherwise de-chunk the remaining data and re-parse from the
+        // de-chunked buffer.
+
+        let describe_start = buf.position();
+
+        // Try the 12c+ path first: skip the chunked prefix, then parse
+        // describe info directly from the remaining buffer.
+        buf.skip_raw_bytes_chunked()?;
+        let columns = self.parse_describe_info(buf, caps.ttc_field_version)?;
+        if !columns.is_empty()
+            && buf
+                .remaining_slice()
+                .first()
+                .copied()
+                .is_some_and(Self::is_query_response_message_type)
+        {
+            return Ok(columns);
+        }
+
+        // 11g fallback: the chunked prefix consumed too much data because
+        // the describe info itself is inside the chunked stream.
+        // Re-read from the start and de-chunk the whole thing.
+        buf.set_position(describe_start)?;
+        let dechunked = buf.read_raw_bytes_chunked()?;
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs 11g dechunked describe ({} bytes), outer remaining={}",
+                dechunked.len(),
+                buf.remaining(),
+            );
+        }
+        if dechunked.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let _inner = ReadBuffer::from_slice(&dechunked);
+        // The de-chunked data starts with a current-date value (7 bytes of
+        // Oracle internal date representation) followed by optional flags.
+        // Scan forward to find the describe info header: a UB4 max_row_size
+        // followed by a UB4 num_columns where num_columns >= 1 and both
+        // have valid UB4 length prefixes (0..=4).
+        let ttc_ver = caps.ttc_field_version;
+        for skip in 0..dechunked.len().saturating_sub(4) {
+            let mut probe = ReadBuffer::from_slice(&dechunked[skip..]);
+            let Ok(cols) = self.parse_describe_info(&mut probe, ttc_ver) else {
+                continue;
+            };
+            if cols.is_empty() {
+                continue;
+            }
+            // After successful parse, the remaining de-chunked bytes hold
+            // the row data and error info that still sits in the outer buf.
+            // We cannot easily re-inject them, but the outer buf now points
+            // past the chunked block so subsequent message parsing will pick
+            // up from there.
+            return Ok(cols);
+        }
+
+        Err(Error::Protocol(
+            "Unable to parse Oracle 11g describe info from de-chunked payload".to_string(),
+        ))
     }
 
     /// Parse query response with pre-known columns (for re-execute after define)
@@ -2656,14 +3101,22 @@ impl Connection {
 
         // Process messages until we hit end of response or run out of data
         while !end_of_response && buf.remaining() > 0 {
+            let msg_pos = buf.position();
             let msg_type = buf.read_u8()?;
+
+            if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+                eprintln!(
+                    "oracle-rs query msg_type={} payload_offset={} remaining={}",
+                    msg_type,
+                    msg_pos,
+                    buf.remaining()
+                );
+            }
 
             match msg_type {
                 // DescribeInfo (16) - column metadata
                 x if x == MessageType::DescribeInfo as u8 => {
-                    // Skip chunked bytes first
-                    buf.skip_raw_bytes_chunked()?;
-                    columns = self.parse_describe_info(&mut buf, caps.ttc_field_version)?;
+                    columns = self.parse_query_describe_info(&mut buf, caps)?;
                 }
 
                 // RowHeader (6) - header info for rows
@@ -2689,7 +3142,8 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, rc) =
+                        self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     cursor_id = cid;
                     row_count = rc;
                     if error_code != 0 && error_code != 1403 {
@@ -2835,7 +3289,8 @@ impl Connection {
 
                 // Error (4) - completion or error
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, _cid, rc) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, _cid, rc) =
+                        self.parse_error_info_with_rowcount(&mut buf, caps.ttc_field_version)?;
                     row_count = rc;
                     if error_code != 0 {
                         return Err(Error::OracleError {
@@ -3018,29 +3473,49 @@ impl Connection {
         buf: &mut ReadBuffer,
         want_row_counts: bool,
     ) -> Result<Option<Vec<u64>>> {
-        // Per Python's _process_return_parameters
-        let num_params = buf.read_ub2()?;  // al8o4l (ignored)
+        // Layout per go-ora command.go case 8:
+        //   size      = UB2          (al8o4l count)
+        //   [size]    = UB4 each     (SCN + remaining values)
+        //   reg       = UB2          (registration)
+        //   num_pairs = UB2
+        //   [pairs]   = key(DLC) + val(DLC) + keyword_num(UB4)
+        //   queryID   = UB4 size + bytes  (TTCVersion >= 4)
+        //   rowcounts = UB4 count + UB8 each (TTCVersion >= 7)
+
+        let num_params = buf.read_ub2()?;
         for _ in 0..num_params {
             buf.skip_ub4()?;
         }
 
-        let al8txl = buf.read_ub2()?;  // al8txl (ignored)
-        if al8txl > 0 {
-            buf.skip(al8txl as usize)?;
+        // registration
+        let reg = buf.read_ub2()?;
+        if reg > 0 {
+            buf.skip(reg as usize)?;
         }
 
-        // num key/value pairs - skip for now
+        // key/value pairs (DLC format: UB4 length, then CLR chunked data)
         let num_pairs = buf.read_ub2()?;
         for _ in 0..num_pairs {
-            buf.read_bytes_with_length()?;  // text value
-            buf.read_bytes_with_length()?;  // binary value
-            buf.skip_ub2()?;  // keyword num
+            // key: UB4 length + chunked bytes
+            let key_len = buf.read_ub4()?;
+            if key_len > 0 {
+                buf.skip_raw_bytes_chunked()?;
+            }
+            // value: UB4 length + chunked bytes
+            let val_len = buf.read_ub4()?;
+            if val_len > 0 {
+                buf.skip_raw_bytes_chunked()?;
+            }
+            // keyword num (UB4)
+            buf.skip_ub4()?;
         }
 
-        // registration
-        let num_bytes = buf.read_ub2()?;
-        if num_bytes > 0 {
-            buf.skip(num_bytes as usize)?;
+        // queryID (TTCVersion >= 4)
+        {
+            let qid_size = buf.read_ub4()? as usize;
+            if qid_size > 0 {
+                buf.skip(qid_size)?;
+            }
         }
 
         // If arraydmlrowcounts was requested, parse the row counts
@@ -3538,7 +4013,7 @@ impl Connection {
             let _call_status = buf.read_ub4()?;  // end of call status
             buf.skip_ub2()?;  // end to end seq#
             buf.skip_ub4()?;  // current row number
-            buf.skip_ub2()?;  // error number (short form)
+            let error_num_short = buf.read_ub2()? as u32;  // error number (short form)
             buf.skip_ub2()?;  // array elem error
             buf.skip_ub2()?;  // array elem error
             let _cursor_id = buf.read_ub2()?;  // cursor id
@@ -3572,41 +4047,70 @@ impl Connection {
             // batch error codes array
             let num_batch_errors = buf.read_ub2()?;
             if num_batch_errors > 0 {
-                // Skip batch error data - we don't process it for now
-                buf.skip_ub1()?;  // first byte
+                buf.skip_ub1()?;
                 for _ in 0..num_batch_errors {
-                    buf.skip_ub2()?;  // error code
+                    buf.skip_ub2()?;
                 }
             }
 
             // batch error row offset array
             let num_offsets = buf.read_ub4()?;
             if num_offsets > 0 {
-                buf.skip_ub1()?;  // first byte
+                buf.skip_ub1()?;
                 for _ in 0..num_offsets {
-                    buf.skip_ub4()?;  // offset
+                    buf.skip_ub4()?;
                 }
             }
 
             // batch error messages array
             let num_batch_msgs = buf.read_ub2()?;
             if num_batch_msgs > 0 {
-                // Skip batch error messages
-                buf.skip_ub1()?;  // packed size
+                buf.skip_ub1()?;
                 for _ in 0..num_batch_msgs {
-                    buf.skip_ub2()?;  // chunk length
-                    buf.read_string_with_length()?;  // message
-                    buf.skip(2)?;  // end marker
+                    buf.skip_ub2()?;
+                    buf.read_string_with_length()?;
+                    buf.skip(2)?;
                 }
             }
 
-            // Extended error number (UB4)
-            let error_num = buf.read_ub4()?;
-            let _row_count = buf.read_ub8()?;  // row number (extended)
+            // Extended error number (UB4) + row count (UB8)
+            // Oracle 11g (ttc_field_version == 6) does not send these fields;
+            // the error message follows directly after the batch arrays.
+            let saved_pos = buf.position();
+            let error_num = match buf.read_ub4() {
+                Ok(v) => if v != 0 { v } else { error_num_short },
+                Err(Error::InvalidLengthIndicator(_)) => {
+                    // 11g: no extended error code; the byte we consumed is
+                    // actually the error message length indicator.  Restore
+                    // position so read_string_with_length can re-read it.
+                    buf.set_position(saved_pos)?;
+                    error_num_short
+                }
+                Err(e) => return Err(e),
+            };
+
+            // Only read row_count when we successfully consumed the extended
+            // error code (position advanced past saved_pos).
+            if buf.position() > saved_pos {
+                let _ = buf.read_ub8();
+            }
 
             // Read error message
             let error_msg = if error_num != 0 {
-                buf.read_string_with_length()?.map(|s| s.trim().to_string())
+                match buf.read_string_with_length() {
+                    Ok(message) => message.map(|s| s.trim().to_string()),
+                    Err(Error::InvalidLengthIndicator(_)) => {
+                        let raw = String::from_utf8_lossy(buf.remaining_bytes())
+                            .trim()
+                            .to_string();
+                        if raw.is_empty() {
+                            None
+                        } else {
+                            Some(raw)
+                        }
+                    }
+                    Err(err) => return Err(err),
+                }
             } else {
                 None
             };
@@ -3625,7 +4129,7 @@ impl Connection {
     }
 
     /// Parse DML response to extract rows affected
-    fn parse_dml_response(&self, payload: &[u8]) -> Result<QueryResult> {
+    fn parse_dml_response(&self, payload: &[u8], ttc_field_version: u8) -> Result<QueryResult> {
         if payload.len() < 3 {
             return Err(Error::Protocol("DML response too short".to_string()));
         }
@@ -3647,7 +4151,8 @@ impl Connection {
             match msg_type {
                 // Error (4) - may contain error or success info
                 x if x == MessageType::Error as u8 => {
-                    let (error_code, error_msg, cid, row_count) = self.parse_error_info_with_rowcount(&mut buf)?;
+                    let (error_code, error_msg, cid, row_count) =
+                        self.parse_error_info_with_rowcount(&mut buf, ttc_field_version)?;
                     cursor_id = cid;
                     rows_affected = row_count;
                     if error_code != 0 && error_code != 1403 {
@@ -3701,7 +4206,13 @@ impl Connection {
     }
 
     /// Parse error info and return (error_code, error_msg, cursor_id, row_count)
-    fn parse_error_info_with_rowcount(&self, buf: &mut ReadBuffer) -> Result<(u32, Option<String>, u16, u64)> {
+    fn parse_error_info_with_rowcount(
+        &self,
+        buf: &mut ReadBuffer,
+        ttc_field_version: u8,
+    ) -> Result<(u32, Option<String>, u16, u64)> {
+        use crate::constants::ccap_value;
+
         // End of call status
         let _call_status = buf.read_ub4()?;
         // End to end seq#
@@ -3709,7 +4220,7 @@ impl Connection {
         // Current row number
         buf.skip_ub4()?;
         // Error number (short form)
-        buf.skip_ub2()?;
+        let error_num_short = buf.read_ub2()? as u32;
         // Array elem error
         buf.skip_ub2()?;
         // Array elem error
@@ -3755,41 +4266,54 @@ impl Connection {
         // Batch error codes array
         let num_batch_errors = buf.read_ub2()?;
         if num_batch_errors > 0 {
-            buf.skip_ub1()?;  // first byte
+            buf.skip_ub1()?;
             for _ in 0..num_batch_errors {
-                buf.skip_ub2()?;  // error code
+                buf.skip_ub2()?;
             }
         }
 
         // Batch error row offset array
         let num_offsets = buf.read_ub4()?;
         if num_offsets > 0 {
-            buf.skip_ub1()?;  // first byte
+            buf.skip_ub1()?;
             for _ in 0..num_offsets {
-                buf.skip_ub4()?;  // offset
+                buf.skip_ub4()?;
             }
         }
 
         // Batch error messages array
         let num_batch_msgs = buf.read_ub2()?;
         if num_batch_msgs > 0 {
-            buf.skip_ub1()?;  // packed size
+            buf.skip_ub1()?;
             for _ in 0..num_batch_msgs {
-                buf.skip_ub2()?;  // chunk length
-                buf.read_string_with_length()?;  // message
-                buf.skip(2)?;  // end marker
+                buf.skip_ub2()?;
+                buf.read_string_with_length()?;
+                buf.skip(2)?;
             }
         }
 
-        // Extended error number (UB4)
-        let error_code = buf.read_ub4()?;
-        // Row count (UB8) - this is the rows affected!
-        let row_count = buf.read_ub8()?;
+        // Extended error number (UB4) + row count (UB8)
+        // Oracle 11g does not send these fields; the error message follows
+        // directly after the batch arrays.
+        let saved_pos = buf.position();
+        let (error_code, row_count) = match buf.read_ub4() {
+            Ok(v) => {
+                let ec = if v != 0 { v } else { error_num_short };
+                let rc = buf.read_ub8().unwrap_or(0);
+                (ec, rc)
+            }
+            Err(Error::InvalidLengthIndicator(_)) => {
+                buf.set_position(saved_pos)?;
+                (error_num_short, 0)
+            }
+            Err(e) => return Err(e),
+        };
 
-        // Fields added in Oracle Database 20c (TTC field version >= 16)
-        // We always skip these since we support Oracle 20c+
-        buf.skip_ub4()?; // sql_type
-        buf.skip_ub4()?; // server_checksum
+        // These fields are only present in newer TTC revisions.
+        if ttc_field_version >= ccap_value::FIELD_VERSION_21_1 && buf.position() > saved_pos {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
+        }
 
         // Error message
         let error_msg = if error_code != 0 {
@@ -3837,7 +4361,10 @@ impl Connection {
 
             buf.skip_ub4()?; // max_num_array_elements
             buf.skip_ub8()?; // cont_flags
-            let _oid = buf.read_bytes_with_length()?; // OID
+            let oid_length = buf.read_ub4()?; // OID length
+            if oid_length > 0 {
+                buf.skip_raw_bytes_chunked()?; // skip OID bytes
+            }
             buf.skip_ub2()?; // version
             buf.skip_ub2()?; // charset_id
             let _csfrm = buf.read_u8()?; // charset form
@@ -4057,6 +4584,49 @@ impl Connection {
         if let Some(ref mut cache) = inner.statement_cache {
             cache.clear();
         }
+    }
+
+    fn extract_embedded_server_error(packet: &[u8]) -> Option<String> {
+        for needle in [b"ORA-".as_slice(), b"TNS-".as_slice()] {
+            if let Some(offset) = packet.windows(needle.len()).position(|window| window == needle) {
+                let tail = &packet[offset..];
+                let end = tail
+                    .iter()
+                    .position(|byte| *byte == 0 || *byte == b'\n')
+                    .unwrap_or(tail.len());
+                return Some(String::from_utf8_lossy(&tail[..end]).to_string());
+            }
+        }
+
+        None
+    }
+
+    fn combine_data_packets(first: &[u8], second: &[u8], large_sdu: bool) -> Result<Bytes> {
+        if first.len() < PACKET_HEADER_SIZE + 2 || second.len() < PACKET_HEADER_SIZE + 2 {
+            return Err(Error::PacketTooShort {
+                expected: PACKET_HEADER_SIZE + 2,
+                actual: first.len().min(second.len()),
+            });
+        }
+        if first[4] != PacketType::Data as u8 || second[4] != PacketType::Data as u8 {
+            return Err(Error::ProtocolError(
+                "Cannot combine non-DATA packets during 11g data-types negotiation".to_string(),
+            ));
+        }
+
+        let mut payload =
+            Vec::with_capacity(first.len() + second.len() - (PACKET_HEADER_SIZE * 2) - 2);
+        payload.extend_from_slice(&first[PACKET_HEADER_SIZE..]);
+        payload.extend_from_slice(&second[PACKET_HEADER_SIZE + 2..]);
+
+        let total_len = (PACKET_HEADER_SIZE + payload.len()) as u32;
+        let header = PacketHeader::new(PacketType::Data, total_len);
+        let mut header_buf = WriteBuffer::with_capacity(PACKET_HEADER_SIZE);
+        header.write(&mut header_buf, large_sdu)?;
+
+        let mut result = header_buf.into_inner().to_vec();
+        result.extend_from_slice(&payload);
+        Ok(Bytes::from(result))
     }
 
     /// Read data from a LOB (CLOB or BLOB)
@@ -5313,7 +5883,24 @@ fn oracle_type_from_name(type_name: &str) -> crate::constants::OracleType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
     use crate::row::Value;
+
+    fn make_test_connection() -> Connection {
+        Connection {
+            inner: Arc::new(Mutex::new(ConnectionInner::new_with_cache(0))),
+            config: Config::new(
+                "localhost".to_string(),
+                1521,
+                "xe".to_string(),
+                "user".to_string(),
+                "password".to_string(),
+            ),
+            closed: AtomicBool::new(false),
+            id: 1,
+        }
+    }
 
     #[test]
     fn test_query_options_default() {
@@ -5365,6 +5952,24 @@ mod tests {
     fn test_connection_state_transitions() {
         assert_eq!(ConnectionState::Disconnected, ConnectionState::Disconnected);
         assert_ne!(ConnectionState::Connected, ConnectionState::Ready);
+    }
+
+    #[test]
+    fn test_parse_legacy_11g_query_response_from_capture() {
+        let conn = make_test_connection();
+        let mut caps = Capabilities::new();
+        caps.ttc_field_version = crate::constants::ccap_value::FIELD_VERSION_11_2;
+        let payload = hex::decode(
+            "0000101700000017e75ddbb9ab3c0d227d53bda738ea01787e0401082a030200000001000000510200008102000000000000000000000000000000000000000000000000010101000000013100000000000000000000000000000700000007787e04010b142300000000e81f0000020000000200000000000000062201000000000002000000000000000000000000000702c10208060053480600000000000200000000000000000000000000000000000100000000000b0000000b80000000453c3c80000000a3000000000004010000000400010000007b050000000002000e00030000000000000000000000000000000000000000000000030000010000000000000000000000000000000000194f52412d30313430333a206e6f206461746120666f756e640a",
+        )
+        .unwrap();
+
+        let result = conn.parse_query_response(&payload, &caps).unwrap();
+
+        assert_eq!(result.columns.len(), 1);
+        assert_eq!(result.columns[0].name, "1");
+        assert_eq!(result.rows.len(), 1);
+        assert_eq!(result.rows[0].get_string(0), Some("1"));
     }
 
     #[test]

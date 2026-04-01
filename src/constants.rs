@@ -193,6 +193,8 @@ impl TryFrom<u8> for MessageType {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum FunctionCode {
+    /// Get Oracle version-date string in new format
+    VersionNewFormat = 59,
     /// Reexecute previous statement
     Reexecute = 4,
     /// Fetch rows
@@ -215,6 +217,8 @@ pub enum FunctionCode {
     TpcTxnChangeState = 104,
     /// Close cursors
     CloseCursors = 105,
+    /// Session switching piggyback (V8)
+    SessionSwitchPiggyback = 107,
     /// Authentication phase one
     AuthPhaseOne = 118,
     /// Authentication phase two
@@ -270,8 +274,8 @@ pub mod version {
     pub const DESIRED: u16 = 319;
     /// Minimum protocol version we support
     pub const MINIMUM: u16 = 300;
-    /// Minimum accepted version (Oracle 12.1)
-    pub const MIN_ACCEPTED: u16 = 315;
+    /// Minimum accepted version (Oracle 11g Release 2 / TNS 314)
+    pub const MIN_ACCEPTED: u16 = 314;
     /// Minimum version supporting large SDU
     pub const MIN_LARGE_SDU: u16 = 315;
     /// Minimum version supporting OOB check

@@ -168,6 +168,13 @@ impl WriteBuffer {
         Ok(())
     }
 
+    /// Write a 32-bit unsigned integer in little-endian format
+    pub fn write_u32_le(&mut self, value: u32) -> Result<()> {
+        self.ensure_capacity(4)?;
+        self.data.put_u32_le(value);
+        Ok(())
+    }
+
     /// Write a 64-bit unsigned integer in big-endian format
     pub fn write_u64_be(&mut self, value: u64) -> Result<()> {
         self.ensure_capacity(8)?;

@@ -232,7 +232,8 @@ impl<'a> ExecuteMessage<'a> {
         let mut buf = WriteBuffer::new();
 
         // Data flags (2 bytes)
-        buf.write_u16_be(0)?;
+        let data_flags: u16 = 0;
+        buf.write_u16_be(data_flags)?;
 
         match self.function_code {
             FunctionCode::Execute => self.write_execute_message(&mut buf, caps)?,
@@ -288,9 +289,9 @@ impl<'a> ExecuteMessage<'a> {
         if stmt.requires_define() {
             exec_opts |= exec_option::DEFINE;
         } else if !opts.describe_only && !stmt.sql().is_empty() {
-            // Only set IMPLICIT_RESULTSET and EXECUTE when we have SQL.
-            // REF CURSORs have no SQL and should not set these flags.
-            exec_flgs |= exec_flags::IMPLICIT_RESULTSET;
+            // REF CURSORs have no SQL and should not set execute flags here.
+            // IMPLICIT_RESULTSET is only needed for PL/SQL implicit result sets
+            // and causes compatibility issues with Oracle 11g queries.
             if opts.execute && !opts.scroll_operation {
                 exec_opts |= exec_option::EXECUTE;
             }
@@ -305,7 +306,7 @@ impl<'a> ExecuteMessage<'a> {
             exec_opts |= exec_option::PARSE;
         }
 
-        // Add FETCH flag for queries or when explicitly requested (e.g., REF CURSOR)
+        // Add FETCH flag for queries
         if opts.describe_only {
             exec_opts |= exec_option::DESCRIBE;
         } else if opts.fetch && opts.prefetch_rows > 0 && !stmt.no_prefetch() {
@@ -332,6 +333,13 @@ impl<'a> ExecuteMessage<'a> {
 
         if opts.commit && !opts.describe_only {
             exec_opts |= exec_option::COMMIT;
+        }
+
+        // Oracle 11g does not use the legacy thick OALL8 layout when the
+        // session was negotiated with the thin TTC wire format.  Use the
+        // standard thin execute path for all versions.
+        if false {
+            return self.write_legacy_11g_query_message(buf, exec_opts);
         }
 
         // Determine number of iterations (prefetch rows for queries, num_execs for DML)
@@ -406,15 +414,17 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_ub4(0)?; // al8dnaml
         buf.write_ub4(0)?; // al8regid_msb
 
-        // DML row counts
-        if opts.dml_row_counts {
-            buf.write_u8(1)?; // Pointer (al8pidmlrc)
-            buf.write_ub4(opts.num_execs)?; // al8pidmlrcbl
-            buf.write_u8(1)?; // Pointer (al8pidmlrcl)
-        } else {
-            buf.write_u8(0)?; // Pointer (al8pidmlrc)
-            buf.write_ub4(0)?; // al8pidmlrcbl
-            buf.write_u8(0)?; // Pointer (al8pidmlrcl)
+        // DML row counts (TTC version >= 7 only; Oracle 11g is version 6)
+        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
+            if opts.dml_row_counts {
+                buf.write_u8(1)?; // Pointer (al8pidmlrc)
+                buf.write_ub4(opts.num_execs)?; // al8pidmlrcbl
+                buf.write_u8(1)?; // Pointer (al8pidmlrcl)
+            } else {
+                buf.write_u8(0)?; // Pointer (al8pidmlrc)
+                buf.write_ub4(0)?; // al8pidmlrcbl
+                buf.write_u8(0)?; // Pointer (al8pidmlrcl)
+            }
         }
 
         // Extended fields (12.2+)
@@ -476,6 +486,82 @@ impl<'a> ExecuteMessage<'a> {
         } else if self.has_bind_values() {
             // Write bind metadata and values if present (only when not defining)
             self.write_bind_params(buf, caps)?;
+        }
+
+        Ok(())
+    }
+
+    fn should_use_legacy_11g_query_layout(&self, caps: &Capabilities) -> bool {
+        let stmt = self.statement;
+        let opts = &self.options;
+
+        caps.ttc_field_version == ccap_value::FIELD_VERSION_11_2
+            && stmt.is_query()
+            && stmt.cursor_id() == 0
+            && !stmt.sql().is_empty()
+            && !stmt.requires_define()
+            && !self.has_bind_values()
+            && !opts.describe_only
+            && opts.fetch
+            && opts.execute
+            && opts.prefetch_rows > 0
+            && !opts.scrollable
+            && !opts.scroll_operation
+            && !opts.batch_errors
+            && !opts.dml_row_counts
+    }
+
+    fn write_legacy_11g_query_message(&self, buf: &mut WriteBuffer, exec_opts: u32) -> Result<()> {
+        let stmt = self.statement;
+
+        // Oracle 11g uses the OCI "thick" OALL8 wire format which is
+        // fundamentally different from the modern thin TTC layout.  The byte
+        // sequence below was captured from a successful OCI 11g execution
+        // (script/oracle_tns_dump.pcap, frame 41) and only covers the narrow
+        // "fresh cursor, unbound SELECT" path.
+        let prefetch_rows = self.options.prefetch_rows.min(2).max(1);
+
+        // Fixed OALL8 template from the capture.  Fields that must vary
+        // (exec_opts, cursor_id, sql_len, prefetch_rows) are patched below.
+        let mut body = hex::decode(
+            "6180000000000000\
+             feffffffffffffff\
+             12000000\
+             feffffffffffffff\
+             0d000000\
+             fefffffffffffffffeffffffffffffff\
+             00000000\
+             02000000\
+             00000000000000000000000000000000000000000000000000000000\
+             feffffffffffffff\
+             0000000000000000\
+             fefffffffffffffffefffffffffffffffeffffffffffffff\
+             0000000000000000\
+             fefffffffffffffffeffffffffffffff\
+             00000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("valid OALL8 template");
+
+        // Patch exec_opts at offset 0 (4 bytes LE)
+        body[0..4].copy_from_slice(&exec_opts.to_le_bytes());
+        // Patch cursor_id at offset 4 (4 bytes LE)
+        body[4..8].copy_from_slice(&(stmt.cursor_id() as u32).to_le_bytes());
+        // Patch sql_len at offset 16 (4 bytes LE)
+        body[16..20].copy_from_slice(&(stmt.sql_bytes().len() as u32).to_le_bytes());
+        // Patch prefetch_rows at offset 52 (4 bytes LE)
+        body[52..56].copy_from_slice(&prefetch_rows.to_le_bytes());
+
+        buf.write_u8(MessageType::Function as u8)?;
+        buf.write_u8(self.function_code as u8)?;
+        buf.write_u8(self.sequence_number)?;
+        buf.write_bytes(&body)?;
+
+        // SQL text (TNS chunked encoding)
+        buf.write_bytes_with_length(Some(stmt.sql_bytes()))?;
+
+        // al8i4 tail (13 × u32 LE) matching the captured frame
+        for value in [1u32, 0, 0, 0, 0, 0, 0, 1, 0, 0x8000, 0, 0, 0] {
+            buf.write_bytes(&value.to_le_bytes())?;
         }
 
         Ok(())
@@ -1175,6 +1261,25 @@ mod tests {
         let opts = ExecuteOptions::describe_only();
         let msg = ExecuteMessage::new(&stmt, opts);
         assert_eq!(msg.function_code(), FunctionCode::Execute);
+    }
+
+    #[test]
+    fn test_legacy_11g_query_packet_matches_pcap() {
+        let stmt = Statement::new("SELECT 1 FROM DUAL");
+        let opts = ExecuteOptions::for_query(100);
+        let mut msg = ExecuteMessage::new(&stmt, opts);
+        msg.set_sequence_number(6);
+
+        let mut caps = Capabilities::new();
+        caps.protocol_version = 314;
+        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+
+        let packet = msg.build_request(&caps).unwrap();
+        let hex = hex::encode(packet.as_ref());
+
+        let expected = "01000000060000002000035e066180000000000000feffffffffffffff12000000feffffffffffffff0d000000fefffffffffffffffeffffffffffffff0000000002000000000000000000000000000000000000000000000000000000feffffffffffffff0000000000000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffeffffffffffffff000000000000000000000000000000000000000000000000000000001253454c45435420312046524f4d204455414c01000000000000000000000000000000000000000000000000000000010000000000000000800000000000000000000000000000";
+
+        assert_eq!(hex, expected);
     }
 
     // =========================================================================

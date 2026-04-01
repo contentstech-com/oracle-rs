@@ -192,7 +192,7 @@
 //!
 //! ## Minimum Oracle Version
 //!
-//! Oracle Database 12c Release 1 (12.1) or later. Some features require newer versions:
+//! Oracle Database 11g Release 2 (11.2) or later. Some features require newer versions:
 //!
 //! - **Native BOOLEAN**: Oracle 23c (emulated on earlier versions)
 //! - **JSON type**: Oracle 21c

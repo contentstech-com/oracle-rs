@@ -7,11 +7,12 @@
 //! with a list of supported data types. The list must include ALL TTC
 //! (Two-Task Common) protocol types, not just SQL types.
 
+
 use bytes::Bytes;
 
 use crate::buffer::{ReadBuffer, WriteBuffer};
 use crate::capabilities::Capabilities;
-use crate::constants::{charset, encoding, MessageType, PacketType, PACKET_HEADER_SIZE};
+use crate::constants::{data_flags, encoding, MessageType, PacketType, PACKET_HEADER_SIZE};
 use crate::error::Result;
 use crate::packet::PacketHeader;
 
@@ -353,6 +354,10 @@ const TNS_DATA_TYPE_PLOP: u16 = 665;
 const TNS_TYPE_REP_UNIVERSAL: u16 = 1;
 const TNS_TYPE_REP_ORACLE: u16 = 10;
 
+
+
+const LEGACY_11G_ENCODING_FLAGS: u8 = 0x83;
+
 /// Complete TTC data types list for protocol negotiation.
 /// This list must include ALL protocol types, not just SQL types.
 /// Ported from python-oracledb's data_types.pyx DATA_TYPES array.
@@ -693,54 +698,99 @@ impl DataTypesMessage {
         Self { _private: () }
     }
 
-    /// Build the DataTypes request packet
-    pub fn build_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
+    fn should_send_data_type(caps: &Capabilities, dt: DataTypeDefinition) -> bool {
+        if caps.ttc_field_version != crate::constants::ccap_value::FIELD_VERSION_11_2 {
+            return true;
+        }
+
+        !matches!(
+            dt.data_type,
+            ORA_TYPE_NUM_JSON
+                | TNS_DATA_TYPE_DJSON
+                | ORA_TYPE_NUM_BOOLEAN
+                | ORA_TYPE_NUM_VECTOR
+                | TNS_DATA_TYPE_IMPLRES
+                | TNS_DATA_TYPE_OER19
+                | TNS_DATA_TYPE_CHUNKINFO
+                | TNS_DATA_TYPE_UD21
+                | TNS_DATA_TYPE_SESSSIGN
+        )
+    }
+
+    fn build_data_packet(payload: &[u8], data_flags_value: u16, large_sdu: bool) -> Result<Bytes> {
         let mut buf = WriteBuffer::with_capacity(4096);
 
         // Reserve space for packet header
         buf.write_zeros(PACKET_HEADER_SIZE)?;
+        buf.write_u16_be(data_flags_value)?;
+        buf.write_bytes(payload)?;
 
-        // Data flags (2 bytes)
-        buf.write_u16_be(0)?;
-
-        // Message type
-        buf.write_u8(MessageType::DataTypes as u8)?;
-
-        // Character set IDs (little-endian)
-        buf.write_u16_le(charset::UTF8)?;
-        buf.write_u16_le(charset::UTF8)?;
-
-        // Encoding flags
-        buf.write_u8(encoding::MULTI_BYTE | encoding::CONV_LENGTH)?;
-
-        // Compile capabilities (length-prefixed)
-        buf.write_bytes_with_length(Some(&caps.compile_caps))?;
-
-        // Runtime capabilities (length-prefixed)
-        buf.write_bytes_with_length(Some(&caps.runtime_caps))?;
-
-        // Data type definitions
-        for dt in DATA_TYPES {
-            buf.write_u16_be(dt.data_type)?;
-            buf.write_u16_be(dt.conv_data_type)?;
-            buf.write_u16_be(dt.representation)?;
-            buf.write_u16_be(0)?; // Reserved
-        }
-
-        // Terminator
-        buf.write_u16_be(0)?;
-
-        // Calculate total length and write header
         let total_len = buf.len() as u32;
         let header = PacketHeader::new(PacketType::Data, total_len);
         let mut header_buf = WriteBuffer::with_capacity(PACKET_HEADER_SIZE);
         header.write(&mut header_buf, large_sdu)?;
 
-        // Patch the header at the beginning
         let mut result = buf.into_inner();
         result[..PACKET_HEADER_SIZE].copy_from_slice(header_buf.as_slice());
 
         Ok(result.freeze())
+    }
+
+    /// Build the DataTypes request packet and optional continuation packet.
+    pub fn build_request_with_continuation(
+        &self,
+        caps: &Capabilities,
+        large_sdu: bool,
+    ) -> Result<(Bytes, Option<Bytes>)> {
+        Ok((self.build_semantic_request(caps, large_sdu)?, None))
+    }
+
+    fn build_semantic_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
+        let mut payload = WriteBuffer::with_capacity(4096);
+
+        // Message type
+        payload.write_u8(MessageType::DataTypes as u8)?;
+
+        // Character set IDs (little-endian)
+        payload.write_u16_le(crate::constants::charset::UTF8)?;
+        payload.write_u16_le(crate::constants::charset::UTF8)?;
+
+        // Encoding flags
+        let encoding_flags = if caps.protocol_version == 314 {
+            LEGACY_11G_ENCODING_FLAGS
+        } else {
+            encoding::MULTI_BYTE | encoding::CONV_LENGTH
+        };
+        payload.write_u8(encoding_flags)?;
+
+        // Compile capabilities (length-prefixed)
+        payload.write_bytes_with_length(Some(&caps.compile_caps))?;
+
+        // Runtime capabilities (length-prefixed)
+        payload.write_bytes_with_length(Some(&caps.runtime_caps))?;
+
+        // Data type definitions
+        for dt in DATA_TYPES
+            .iter()
+            .copied()
+            .filter(|dt| Self::should_send_data_type(caps, *dt))
+        {
+            payload.write_u16_be(dt.data_type)?;
+            payload.write_u16_be(dt.conv_data_type)?;
+            payload.write_u16_be(dt.representation)?;
+            payload.write_u16_be(0)?; // Reserved
+        }
+
+        // Terminator
+        payload.write_u16_be(0)?;
+
+        Self::build_data_packet(payload.as_slice(), 0, large_sdu)
+    }
+
+    /// Build the DataTypes request packet
+    pub fn build_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
+        let (request, _continuation) = self.build_request_with_continuation(caps, large_sdu)?;
+        Ok(request)
     }
 
     /// Parse the DataTypes response
@@ -781,6 +831,7 @@ impl Default for DataTypesMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::constants::{ccap_value, charset};
 
     #[test]
     fn test_data_types_count() {
@@ -808,6 +859,22 @@ mod tests {
         ]);
         assert_eq!(charset1, charset::UTF8);
     }
+
+    #[test]
+    fn test_build_legacy_11g_data_types_request() {
+        let mut caps = Capabilities::new();
+        caps.protocol_version = 314;
+        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+
+        let msg = DataTypesMessage::new();
+        let packet = msg.build_request(&caps, false).unwrap();
+
+        assert_eq!(packet[PACKET_HEADER_SIZE], 0);
+        assert_eq!(packet[PACKET_HEADER_SIZE + 1], 0);
+        assert_eq!(packet[PACKET_HEADER_SIZE + 2], MessageType::DataTypes as u8);
+        assert_eq!(packet[PACKET_HEADER_SIZE + 7], LEGACY_11G_ENCODING_FLAGS);
+    }
+
 
     #[test]
     fn test_critical_internal_types_present() {

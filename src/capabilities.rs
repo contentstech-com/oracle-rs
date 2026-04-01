@@ -147,6 +147,45 @@ impl Capabilities {
         self.runtime_caps[TTC] = TTC_ZERO_COPY | TTC_32K;
     }
 
+    fn apply_legacy_11g_profile(&mut self) {
+        use ccap_index::*;
+        use rcap_index::*;
+        use rcap_value::*;
+
+        // Do NOT downgrade FIELD_VERSION to 6 (FIELD_VERSION_11_2).
+        // The server already provided its FIELD_VERSION in the protocol
+        // negotiation response, and adjust_for_server_compile_caps() has
+        // already set ttc_field_version = min(client, server).
+        //
+        // Keeping the client's FIELD_VERSION above 6 is essential because
+        // a value of 6 tells the 11g server to use the OCI "thick" wire
+        // format (8-byte pointers, fixed LE integers), which is incompatible
+        // with the thin TTC encoding that oracle-rs uses everywhere else.
+        //
+        // go-ora (a pure-Go driver proven to work with 11g) sends
+        // FIELD_VERSION = 11 and the server accepts thin-encoded messages.
+
+        // Cap the advertised FIELD_VERSION to a value Oracle 11g
+        // understands.  go-ora uses 11 and works; 24 is too far ahead
+        // for the 11g parser and causes ORA-03120.
+        // Cap FIELD_VERSION to match what go-ora sends (11).  The
+        // init_compile_caps default (FIELD_VERSION_MAX = 24) is too high
+        // for Oracle 11g to parse correctly.
+        self.compile_caps[FIELD_VERSION] = 11;
+
+        // Disable features that did not exist in 11g
+        self.compile_caps[SESS_SIGNATURE_VERSION] = 0;
+        self.compile_caps[LOB2] = 0;
+        self.compile_caps[TTC5] = 0;
+        self.compile_caps[VECTOR_FEATURES] = 0;
+
+        self.runtime_caps[TTC] = TTC_ZERO_COPY;
+        self.max_string_size = 4000;
+        self.supports_end_of_response = false;
+        self.supports_pipelining = false;
+        self.supports_request_boundaries = false;
+    }
+
     /// Adjust capabilities based on ACCEPT packet response
     pub fn adjust_for_protocol(
         &mut self,
@@ -177,13 +216,23 @@ impl Capabilities {
 
     /// Adjust capabilities based on server's compile-time capabilities
     pub fn adjust_for_server_compile_caps(&mut self, server_caps: &[u8]) {
-        // Adjust field version to minimum of client and server
+        // Record the server's field version for conditional logic (e.g.
+        // skipping 12.2+ fields in execute responses).  However, do NOT
+        // propagate the downgrade into compile_caps — the advertised
+        // FIELD_VERSION sent to the server during TTIDTY must remain at the
+        // client's original (high) value so the server selects the thin TTC
+        // encoding, not the legacy OCI thick encoding.
         if server_caps.len() > ccap_index::FIELD_VERSION {
             let server_version = server_caps[ccap_index::FIELD_VERSION];
             if server_version < self.ttc_field_version {
                 self.ttc_field_version = server_version;
-                self.compile_caps[ccap_index::FIELD_VERSION] = server_version;
             }
+        }
+
+        if self.protocol_version <= crate::constants::version::MIN_ACCEPTED {
+            self.apply_legacy_11g_profile();
+            // Do NOT return early — let the remaining checks run so that
+            // end_of_response / boundary support is correctly disabled.
         }
 
         // Check for explicit boundary support
