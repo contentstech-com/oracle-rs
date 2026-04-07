@@ -7,7 +7,9 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 use crate::buffer::WriteBuffer;
 use crate::capabilities::Capabilities;
-use crate::constants::{FetchOrientation, FunctionCode, MessageType, PacketType, PACKET_HEADER_SIZE};
+use crate::constants::{
+    FetchOrientation, FunctionCode, MessageType, PacketType, PACKET_HEADER_SIZE,
+};
 use crate::error::Result;
 
 /// Fetch message to retrieve rows from a cursor
@@ -17,6 +19,8 @@ pub struct FetchMessage {
     cursor_id: u16,
     /// Number of rows to fetch
     num_rows: u32,
+    /// Sequence number
+    sequence_number: u8,
     /// Fetch orientation for scrollable cursors
     orientation: Option<FetchOrientation>,
     /// Fetch offset/position for scrollable cursors
@@ -29,6 +33,7 @@ impl FetchMessage {
         Self {
             cursor_id,
             num_rows,
+            sequence_number: 0,
             orientation: None,
             offset: 0,
         }
@@ -44,23 +49,32 @@ impl FetchMessage {
         Self {
             cursor_id,
             num_rows,
+            sequence_number: 0,
             orientation: Some(orientation),
             offset,
         }
+    }
+
+    /// Set the sequence number
+    pub fn set_sequence_number(&mut self, seq: u8) {
+        self.sequence_number = seq;
     }
 
     /// Build the fetch request packet
     pub fn build_request(&self, _caps: &Capabilities) -> Result<Bytes> {
         let mut buf = WriteBuffer::new();
 
+        // Data flags (2 bytes)
+        buf.write_u16_be(0)?;
+
         // Write message header
         buf.write_u8(MessageType::Function as u8)?;
         buf.write_u8(FunctionCode::Fetch as u8)?;
-        buf.write_u8(0)?; // Sequence number
+        buf.write_u8(self.sequence_number)?;
 
         // Write fetch body
-        buf.write_ub4(self.cursor_id as u32)?;
-        buf.write_ub4(self.num_rows)?;
+        buf.write_ub2(self.cursor_id)?;
+        buf.write_ub2(self.num_rows as u16)?;
 
         // Write scrollable cursor fields if present
         if let Some(orientation) = self.orientation {
@@ -80,9 +94,6 @@ impl FetchMessage {
         packet.put_u8(PacketType::Data as u8);
         packet.put_u8(0); // Flags
         packet.put_u16(0); // Header checksum
-
-        // Data flags (2 bytes)
-        packet.put_u16(0);
 
         // Payload
         packet.extend_from_slice(&payload);
