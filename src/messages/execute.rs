@@ -232,7 +232,11 @@ impl<'a> ExecuteMessage<'a> {
         let mut buf = WriteBuffer::new();
 
         // Data flags (2 bytes)
-        let data_flags: u16 = 0;
+        let data_flags: u16 = if self.should_use_legacy_11g_query_layout(caps) {
+            0x2000
+        } else {
+            0
+        };
         buf.write_u16_be(data_flags)?;
 
         match self.function_code {
@@ -312,6 +316,7 @@ impl<'a> ExecuteMessage<'a> {
         // execute messages.
         let suppress_initial_11g_query_fetch = caps.ttc_field_version
             <= ccap_value::FIELD_VERSION_11_2
+            && !self.should_use_legacy_11g_query_layout(caps)
             && stmt.is_query()
             && stmt.cursor_id() == 0
             && opts.execute
@@ -352,10 +357,7 @@ impl<'a> ExecuteMessage<'a> {
             return self.write_legacy_11g_fetch_message(buf, exec_opts, caps);
         }
 
-        // Oracle 11g does not use the legacy thick OALL8 layout for the
-        // initial thin query execute captured here. Keep the specialized
-        // template disabled unless a future capture proves otherwise.
-        if false {
+        if self.should_use_legacy_11g_query_layout(caps) {
             return self.write_legacy_11g_query_message(buf, exec_opts);
         }
 
@@ -558,7 +560,7 @@ impl<'a> ExecuteMessage<'a> {
         // sequence below was captured from a successful OCI 11g execution
         // (script/oracle_tns_dump.pcap, frame 41) and only covers the narrow
         // "fresh cursor, unbound SELECT" path.
-        let prefetch_rows = self.options.prefetch_rows.min(2).max(1);
+        let prefetch_rows = self.options.prefetch_rows.clamp(1, 2);
 
         // Fixed OALL8 template from the capture.  Fields that must vary
         // (exec_opts, cursor_id, sql_len, prefetch_rows) are patched below.
@@ -571,7 +573,7 @@ impl<'a> ExecuteMessage<'a> {
              fefffffffffffffffeffffffffffffff\
              00000000\
              02000000\
-             00000000000000000000000000000000000000000000000000000000\
+             000000000000000000000000000000000000000000000000\
              feffffffffffffff\
              0000000000000000\
              fefffffffffffffffefffffffffffffffeffffffffffffff\
@@ -640,15 +642,9 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_u8(0)?; // no define pointer
         buf.write_u8(0)?; // no define count
 
-        if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
-            buf.write_u8(0)?;
-            buf.write_u8(0)?;
-            buf.write_u8(1)?;
-        } else {
-            buf.write_u8(0)?;
-            buf.write_u8(0)?;
-            buf.write_u8(1)?;
-        }
+        buf.write_u8(0)?;
+        buf.write_u8(0)?;
+        buf.write_u8(1)?;
 
         if caps.ttc_field_version >= ccap_value::FIELD_VERSION_11_2 {
             buf.write_u8(0)?;

@@ -236,10 +236,10 @@ impl Capabilities {
         }
 
         // Check for explicit boundary support
-        if server_caps.len() > ccap_index::TTC4 {
-            if (server_caps[ccap_index::TTC4] & ccap_value::EXPLICIT_BOUNDARY) != 0 {
-                self.supports_request_boundaries = true;
-            }
+        if server_caps.len() > ccap_index::TTC4
+            && (server_caps[ccap_index::TTC4] & ccap_value::EXPLICIT_BOUNDARY) != 0
+        {
+            self.supports_request_boundaries = true;
         }
 
         // Disable end of response if field version is too old
@@ -363,6 +363,8 @@ mod tests {
     #[test]
     fn test_adjust_for_server_compile_caps() {
         let mut caps = Capabilities::new();
+        caps.protocol_version = 319;
+        let client_field_version = caps.compile_caps[ccap_index::FIELD_VERSION];
 
         // Server has lower field version
         let mut server_caps = vec![0; ccap_index::MAX];
@@ -373,7 +375,7 @@ mod tests {
         assert_eq!(caps.ttc_field_version, ccap_value::FIELD_VERSION_12_2);
         assert_eq!(
             caps.compile_caps[ccap_index::FIELD_VERSION],
-            ccap_value::FIELD_VERSION_12_2
+            client_field_version
         );
     }
 

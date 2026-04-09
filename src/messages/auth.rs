@@ -664,30 +664,6 @@ impl AuthMessage {
         ))
     }
 
-    fn build_connect_string(&self) -> Option<String> {
-        let host = match self.connect_host.as_deref()? {
-            "localhost" => "127.0.0.1",
-            other => other,
-        };
-        let port = self.connect_port?;
-        let connect_data = if self.service_is_sid {
-            format!("SID={}", self._service_name)
-        } else {
-            format!("SERVICE_NAME={}", self._service_name)
-        };
-
-        Some(format!(
-            "(DESCRIPTION=(CONNECT_DATA=({})(CID=(PROGRAM={})(HOST={})(USER={})))\
-             (ADDRESS=(PROTOCOL=tcp)(HOST={})(PORT={})))",
-            connect_data,
-            self.program,
-            self.machine,
-            self.osuser,
-            host,
-            port,
-        ))
-    }
-
     /// Write a key-value pair to the buffer
     fn write_key_value(
         &self,
@@ -820,12 +796,7 @@ impl AuthMessage {
     pub fn parse_response(&mut self, payload: &[u8]) -> Result<()> {
         let (pairs, vtype) = match Self::parse_compact_response_pairs(payload) {
             Ok(parsed) => parsed,
-            Err(err)
-                if matches!(
-                    err,
-                    Error::InvalidLengthIndicator(_) | Error::BufferUnderflow { .. }
-                ) =>
-            {
+            Err(Error::InvalidLengthIndicator(_) | Error::BufferUnderflow { .. }) => {
                 Self::parse_legacy_11g_response_pairs(payload)?
             }
             Err(err) => return Err(err),

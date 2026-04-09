@@ -4777,7 +4777,6 @@ mod statement_cache_reuse_tests {
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_cached_query_with_bind_params_returns_correct_values() {
-        use oracle_rs::Value;
         let conn = connect().await.expect("Failed to connect");
 
         let sql = "SELECT emp_id, first_name, salary FROM test_employees WHERE dept_id = :1 ORDER BY emp_id";

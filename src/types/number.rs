@@ -305,7 +305,7 @@ pub fn encode_oracle_number(value: &str) -> Result<Vec<u8>> {
     }
 
     // Check bounds
-    if digits.len() > MAX_DIGITS || decimal_point_index > 126 || decimal_point_index < -129 {
+    if digits.len() > MAX_DIGITS || !(-129..=126).contains(&decimal_point_index) {
         return Err(Error::DataConversionError(
             "Number out of range for Oracle NUMBER".to_string(),
         ));

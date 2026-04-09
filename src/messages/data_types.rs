@@ -12,7 +12,7 @@ use bytes::Bytes;
 
 use crate::buffer::{ReadBuffer, WriteBuffer};
 use crate::capabilities::Capabilities;
-use crate::constants::{data_flags, encoding, MessageType, PacketType, PACKET_HEADER_SIZE};
+use crate::constants::{encoding, MessageType, PacketType, PACKET_HEADER_SIZE};
 use crate::error::Result;
 use crate::packet::PacketHeader;
 
