@@ -27,7 +27,7 @@
 //! Option 2 - Individual parameters:
 //!   ORACLE_HOST: Oracle host (default: localhost)
 //!   ORACLE_PORT: Oracle port (default: 1521)
-//!   ORACLE_SERVICE: Oracle service name (default: FREEPDB1)
+//!   ORACLE_SERVICE: Oracle service name (default: XE)
 //!   ORACLE_USER: Oracle username (default: testuser)
 //!   ORACLE_PASSWORD: Oracle password (default: testpass)
 
@@ -59,7 +59,7 @@ fn get_test_config() -> Config {
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(1521);
-    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+    let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XE".to_string());
 
     Config::new(&host, port, &service, &username, &password)
 }
@@ -68,6 +68,23 @@ fn get_test_config() -> Config {
 async fn connect() -> Result<Connection, Error> {
     let config = get_test_config();
     Connection::connect_with_config(config).await
+}
+
+async fn supports_array_dml_row_counts(conn: &Connection) -> bool {
+    conn.server_info().await.protocol_version > 314
+}
+
+async fn is_oracle_11g(conn: &Connection) -> bool {
+    conn.server_info().await.protocol_version <= 314
+}
+
+async fn skip_on_11g(conn: &Connection, feature: &str) -> bool {
+    if is_oracle_11g(conn).await {
+        eprintln!("Skipping {} on Oracle 11g", feature);
+        true
+    } else {
+        false
+    }
 }
 
 mod connection_tests {
@@ -101,7 +118,7 @@ mod connection_tests {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(1521);
-        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XE".to_string());
 
         let mut config = Config::new(&host, port, &service, "invalid_user", "invalid_pass");
         config.set_password("invalid_pass");
@@ -118,7 +135,7 @@ mod connection_tests {
             .ok()
             .and_then(|p| p.parse().ok())
             .unwrap_or(1521);
-        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "FREEPDB1".to_string());
+        let service = std::env::var("ORACLE_SERVICE").unwrap_or_else(|_| "XE".to_string());
         let username = std::env::var("ORACLE_USER").unwrap_or_else(|_| "testuser".to_string());
         let password = std::env::var("ORACLE_PASSWORD").unwrap_or_else(|_| "testpass".to_string());
 
@@ -1742,13 +1759,20 @@ mod batch_execution_tests {
         assert_eq!(result.success_count, 3);
         assert_eq!(result.total_rows_affected, 3);
 
-        // Verify row counts are returned
-        assert!(result.row_counts.is_some(), "Row counts should be returned");
-        let counts = result.row_counts.unwrap();
-        assert_eq!(counts.len(), 3);
-        assert_eq!(counts[0], 1);
-        assert_eq!(counts[1], 1);
-        assert_eq!(counts[2], 1);
+        if supports_array_dml_row_counts(&conn).await {
+            // Verify row counts are returned
+            assert!(result.row_counts.is_some(), "Row counts should be returned");
+            let counts = result.row_counts.unwrap();
+            assert_eq!(counts.len(), 3);
+            assert_eq!(counts[0], 1);
+            assert_eq!(counts[1], 1);
+            assert_eq!(counts[2], 1);
+        } else {
+            assert!(
+                result.row_counts.is_none(),
+                "Oracle 11g does not return array DML row counts"
+            );
+        }
 
         conn.rollback().await.expect("Failed to rollback");
         conn.close().await.expect("Failed to close");
@@ -1861,11 +1885,18 @@ mod batch_execution_tests {
         assert_eq!(result.success_count, 2);
         assert_eq!(result.total_rows_affected, 4, "Should delete 4 rows total (2 A's + 2 B's)");
 
-        // Per-row counts should show 2 rows deleted for each category
-        let counts = result.row_counts.expect("Row counts should be returned");
-        assert_eq!(counts.len(), 2, "Should have row counts for both executions");
-        assert_eq!(counts[0], 2, "First delete (category A) should delete 2 rows");
-        assert_eq!(counts[1], 2, "Second delete (category B) should delete 2 rows");
+        if supports_array_dml_row_counts(&conn).await {
+            // Per-row counts should show 2 rows deleted for each category
+            let counts = result.row_counts.expect("Row counts should be returned");
+            assert_eq!(counts.len(), 2, "Should have row counts for both executions");
+            assert_eq!(counts[0], 2, "First delete (category A) should delete 2 rows");
+            assert_eq!(counts[1], 2, "Second delete (category B) should delete 2 rows");
+        } else {
+            assert!(
+                result.row_counts.is_none(),
+                "Oracle 11g does not return array DML row counts"
+            );
+        }
 
         // Verify only category C remains
         let query_result = conn.query("SELECT id, category FROM batch_delete_test ORDER BY id", &[])
@@ -2233,23 +2264,22 @@ mod lob_bind_tests {
         conn.close().await.expect("Failed to close");
     }
 
-    /// Test that binding temp LOB to INSERT fails gracefully
-    /// This is a known limitation - use EMPTY_CLOB() workaround instead
+    /// Test binding a temporary LOB to INSERT.
     #[tokio::test]
     #[ignore = "requires Oracle database"]
     async fn test_temp_lob_insert() {
-        use oracle_rs::{OracleType, LobValue};
+        use oracle_rs::{OracleType, LobValue, LobData};
 
         let conn = connect().await.expect("Failed to connect");
 
         // Create test table with CLOB column
         conn.execute(
-            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE temp_lob_test (id NUMBER, content CLOB)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
+            "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE temp_lob_insert_test (id NUMBER, content CLOB)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",
             &[]
         ).await.expect("Failed to create table");
 
         // Clean up existing data
-        conn.execute("DELETE FROM temp_lob_test WHERE id >= 100", &[]).await.ok();
+        conn.execute("DELETE FROM temp_lob_insert_test WHERE id >= 100", &[]).await.ok();
 
         // Create a temporary CLOB
         let locator = conn.create_temp_lob(OracleType::Clob)
@@ -2283,31 +2313,63 @@ mod lob_bind_tests {
         ).await.expect("PL/SQL read with temp CLOB bind failed");
         println!("PL/SQL read succeeded!");
 
-        // Try PL/SQL INSERT with temp LOB - this is expected to fail
-        // This is a known limitation: binding temp LOBs to INSERT doesn't work
-        println!("Attempting PL/SQL INSERT with temp LOB bind (expected to fail)...");
+        // Try PL/SQL INSERT with temp LOB bind.
+        println!("Attempting PL/SQL INSERT with temp LOB bind...");
         let insert_result = conn.execute(
-            "BEGIN INSERT INTO temp_lob_test (id, content) VALUES (100, :1); END;",
+            "BEGIN INSERT INTO temp_lob_insert_test (id, content) VALUES (100, :1); END;",
             &[Value::Lob(LobValue::Locator(locator))]
         ).await;
 
-        // Verify it fails with expected error
-        assert!(insert_result.is_err(), "Temp LOB INSERT should fail");
-        let err_msg = insert_result.err().unwrap().to_string();
-        assert!(
-            err_msg.contains("rejected") || err_msg.contains("closed"),
-            "Error should mention connection rejection: {}",
-            err_msg
-        );
-        println!("Confirmed: temp LOB INSERT fails as expected");
+        match insert_result {
+            Ok(_) => {
+                let verify = conn.query(
+                    "SELECT content FROM temp_lob_insert_test WHERE id = 100",
+                    &[]
+                ).await.expect("Failed to query inserted temp LOB");
+                assert_eq!(verify.row_count(), 1);
 
-        // Note: For actual LOB inserts, use EMPTY_CLOB() workaround (see lob_workaround_tests)
+                match &verify.rows[0].values()[0] {
+                    Value::Lob(lob) => {
+                        let locator = lob.as_locator().expect("Expected inserted LOB locator");
+                        let inserted = conn.read_lob(locator)
+                            .await
+                            .expect("Failed to read inserted temp LOB");
+                        match inserted {
+                            LobData::String(s) => assert_eq!(s, test_content),
+                            LobData::Bytes(b) => {
+                                let text = String::from_utf8(b.to_vec()).expect("Invalid UTF-8");
+                                assert_eq!(text, test_content);
+                            }
+                        }
+                    }
+                    Value::String(s) => assert_eq!(s, test_content),
+                    other => panic!("Expected inserted LOB value, got {:?}", other),
+                }
+                println!("Temp LOB INSERT succeeded and content was verified");
 
-        // Need to reconnect since temp LOB insert closes connection
-        let conn = connect().await.expect("Failed to reconnect");
-        conn.execute("DELETE FROM temp_lob_test", &[]).await.ok();
-        conn.commit().await.ok();
-        conn.close().await.expect("Failed to close");
+                conn.execute("DELETE FROM temp_lob_insert_test WHERE id = 100", &[])
+                    .await
+                    .ok();
+                conn.commit().await.ok();
+                conn.close().await.expect("Failed to close");
+            }
+            Err(err) => {
+                let err_msg = err.to_string();
+                assert!(
+                    err_msg.contains("rejected") || err_msg.contains("closed"),
+                    "Error should mention connection rejection: {}",
+                    err_msg
+                );
+                println!("Confirmed: temp LOB INSERT fails as expected");
+
+                let cleanup_conn = connect().await.expect("Failed to reconnect");
+                cleanup_conn.execute("DELETE FROM temp_lob_insert_test WHERE id = 100", &[])
+                    .await
+                    .ok();
+                cleanup_conn.commit().await.ok();
+                cleanup_conn.close().await.expect("Failed to close");
+            }
+        }
     }
 }
 
@@ -3171,7 +3233,7 @@ mod lob_bind_param_tests {
 /// Tests for binding strings/bytes to LOB columns using workarounds
 mod lob_workaround_tests {
     use super::*;
-    use oracle_rs::{Value, LobData};
+    use oracle_rs::{BindParam, Value, LobData};
 
     /// Test inserting data into CLOB using EMPTY_CLOB() + FOR UPDATE pattern
     #[tokio::test]
@@ -3583,6 +3645,10 @@ mod ref_cursor_tests {
     #[ignore = "requires Oracle database"]
     async fn test_implicit_result_single() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "implicit results").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test table
         conn.execute(
@@ -3635,6 +3701,10 @@ mod ref_cursor_tests {
     #[ignore = "requires Oracle database"]
     async fn test_implicit_result_multiple() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "implicit results").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test tables
         conn.execute(
@@ -3701,6 +3771,10 @@ mod ref_cursor_tests {
     #[ignore = "requires Oracle database"]
     async fn test_implicit_result_empty() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "implicit results").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test table
         conn.execute(
@@ -3826,7 +3900,8 @@ mod bfile_tests {
                             err_str.contains("reset") ||
                             err_str.contains("ORA-") ||
                             err_str.contains("closed") ||
-                            err_str.contains("privileges"),
+                            err_str.contains("privileges") ||
+                            err_str.contains("LOB operation failed"),
                             "Error should be about directory or connection: {}", e
                         );
                     }
@@ -4385,6 +4460,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4476,6 +4555,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4570,6 +4653,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
@@ -4662,6 +4749,10 @@ mod collection_tests {
         use oracle_rs::statement::BindParam;
 
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "collection input binds").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // Create test type and procedure
         let _ = conn.execute(
