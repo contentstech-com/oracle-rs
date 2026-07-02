@@ -39,7 +39,7 @@ use crate::buffer::{ReadBuffer, WriteBuffer};
 use crate::capabilities::Capabilities;
 use crate::config::{Config, ServiceMethod};
 use crate::constants::{
-    BindDirection, FetchOrientation, FunctionCode, MessageType, OracleType, PacketType,
+    version, BindDirection, FetchOrientation, FunctionCode, MessageType, OracleType, PacketType,
     PACKET_HEADER_SIZE,
 };
 use crate::cursor::{ScrollResult, ScrollableCursor};
@@ -457,7 +457,7 @@ impl ConnectionInner {
     ) -> Result<bytes::Bytes> {
         use crate::constants::{data_flags, MessageType};
 
-        let legacy_11g = self.server_info.protocol_version <= 314;
+        let legacy_11g = self.server_info.protocol_version <= version::MIN_ACCEPTED;
         let is_lob = lob_parameter_body_len.is_some();
         // Hoisted once instead of re-reading the environment on every packet.
         let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
@@ -733,7 +733,8 @@ impl ConnectionInner {
 
             if msg_type == MessageType::LobData as u8 {
                 *saw_lob_data = true;
-                let lob_data_result = if self.server_info.protocol_version <= 314 {
+                let lob_data_result = if self.server_info.protocol_version <= version::MIN_ACCEPTED
+                {
                     Self::skip_legacy_11g_lob_data(&mut buf)
                 } else {
                     buf.skip_raw_bytes_chunked()
@@ -1074,7 +1075,7 @@ impl Connection {
             inner.server_info.protocol_version
         };
 
-        if protocol_version > 314
+        if protocol_version > version::MIN_ACCEPTED
             || !query_result.rows.is_empty()
             || !query_result.has_more_rows
             || query_result.cursor_id == 0
@@ -1530,7 +1531,7 @@ impl Connection {
         }
         inner.sequence_number = 2;
 
-        if inner.server_info.protocol_version <= 314 {
+        if inner.server_info.protocol_version <= version::MIN_ACCEPTED {
             let mut ver_buf = crate::buffer::WriteBuffer::with_capacity(32);
             ver_buf.write_zeros(PACKET_HEADER_SIZE)?;
             ver_buf.write_u16_be(0)?;
@@ -2249,7 +2250,7 @@ impl Connection {
         let mut inner = self.inner.lock().await;
         let protocol_version = inner.server_info.protocol_version;
         let previous_values = inner.fetch_seed_rows.get(&cursor_id).cloned();
-        let request = if protocol_version <= 314 {
+        let request = if protocol_version <= version::MIN_ACCEPTED {
             use crate::messages::ExecuteMessage;
 
             let mut stmt = Statement::new("");
@@ -2286,7 +2287,7 @@ impl Connection {
         // Parse row data from response
         let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
-        let legacy_11g = inner.server_info.protocol_version <= 314;
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
         drop(inner); // Release lock before parsing
         let mut result = self.parse_fetch_response(
             payload,
@@ -2379,7 +2380,7 @@ impl Connection {
 
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
-        let sequence_number = if inner.server_info.protocol_version <= 314 {
+        let sequence_number = if inner.server_info.protocol_version <= version::MIN_ACCEPTED {
             0
         } else {
             inner.next_sequence_number()
@@ -2413,7 +2414,7 @@ impl Connection {
         // Parse query response - use cursor's columns since they're already defined
         let payload = &response[PACKET_HEADER_SIZE..];
         let caps = inner.capabilities.clone();
-        let legacy_11g = inner.server_info.protocol_version <= 314;
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
         let previous_values = inner.fetch_seed_rows.get(&cursor.cursor_id()).cloned();
         drop(inner); // Release lock before parsing
         let mut result = self.parse_fetch_response(
@@ -3006,7 +3007,11 @@ impl Connection {
         };
         // 11g cannot detect multi-packet end-of-response, so it defaults to no
         // prefetch (rows fetched via fetch_more()); newer servers prefetch 100.
-        let default_prefetch_rows: u32 = if protocol_version <= 314 { 0 } else { 100 };
+        let default_prefetch_rows: u32 = if protocol_version <= version::MIN_ACCEPTED {
+            0
+        } else {
+            100
+        };
         let prefetch_rows: u32 = std::env::var("ORACLE_RS_PREFETCH_ROWS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -3022,7 +3027,7 @@ impl Connection {
 
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
-        let sequence_number = if inner.server_info.protocol_version <= 314 {
+        let sequence_number = if inner.server_info.protocol_version <= version::MIN_ACCEPTED {
             0
         } else {
             inner.next_sequence_number()
@@ -3496,17 +3501,11 @@ impl Connection {
         ))
     }
 
-    fn is_legacy_11g_ttc(caps: &Capabilities) -> bool {
-        caps.ttc_field_version <= crate::constants::ccap_value::FIELD_VERSION_11_2
-    }
-
     fn parse_query_describe_info(
         &self,
         buf: &mut ReadBuffer,
         caps: &Capabilities,
     ) -> Result<(Vec<ColumnInfo>, Option<Vec<u8>>)> {
-        use crate::constants::ccap_value;
-
         // The describe info response starts with a TNS chunked-encoded
         // prefix (current date, dcb flags, etc.) followed by the column
         // metadata.  On Oracle 12c+ the chunked prefix is small and
@@ -3527,7 +3526,7 @@ impl Connection {
         let after_prefix = buf.position();
         let columns = self.parse_describe_info(buf, caps.ttc_field_version)?;
         if !columns.is_empty()
-            && (caps.ttc_field_version <= ccap_value::FIELD_VERSION_11_2
+            && (caps.is_legacy_11g_ttc()
                 || buf
                     .remaining_slice()
                     .first()
@@ -3562,7 +3561,7 @@ impl Connection {
             return Ok((cols, None));
         }
 
-        if caps.ttc_field_version <= ccap_value::FIELD_VERSION_11_2 {
+        if caps.is_legacy_11g_ttc() {
             if let Some(cols) = self.parse_legacy_11g_describe_info(buf, describe_start)? {
                 return Ok((cols, None));
             }
@@ -3728,7 +3727,7 @@ impl Connection {
                     let (error_code, error_msg, cid, rc) = match parsed_error {
                         Ok(parsed) => parsed,
                         Err(Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_))
-                            if Self::is_legacy_11g_ttc(caps) && !rows.is_empty() =>
+                            if caps.is_legacy_11g_ttc() && !rows.is_empty() =>
                         {
                             end_of_response = true;
                             continue;
@@ -3755,7 +3754,7 @@ impl Connection {
                     match self.parse_return_parameters(&mut buf) {
                         Ok(()) => {}
                         Err(Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_))
-                            if Self::is_legacy_11g_ttc(caps) =>
+                            if caps.is_legacy_11g_ttc() =>
                         {
                             buf.set_position(parameter_start)?;
                             self.skip_legacy_11g_parameter(&mut buf)?;
@@ -5425,7 +5424,7 @@ impl Connection {
     ) -> Result<LobData> {
         let mut inner = self.inner.lock().await;
         let large_sdu = inner.large_sdu;
-        let legacy_11g = inner.server_info.protocol_version <= 314;
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
 
         // Create LOB operation message for read
         let mut lob_msg = LobOpMessage::new_read(locator, offset, amount);

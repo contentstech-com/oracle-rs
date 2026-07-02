@@ -6,7 +6,7 @@
 use crate::buffer::WriteBuffer;
 use crate::capabilities::Capabilities;
 use crate::constants::{
-    ccap_value, charset, length, lob_duration, lob_op, FunctionCode, MessageType, OracleType,
+    charset, length, lob_duration, lob_op, FunctionCode, MessageType, OracleType,
     PacketType, PACKET_HEADER_SIZE,
 };
 use crate::error::Result;
@@ -376,7 +376,7 @@ impl<'a> LobOpMessage<'a> {
         // Write data for write operations
         if let Some(data) = self.write_data {
             buf.write_u8(MessageType::LobData as u8)?;
-            if caps.ttc_field_version <= ccap_value::FIELD_VERSION_11_2 {
+            if caps.is_legacy_11g_ttc() {
                 Self::write_legacy_11g_lob_data(buf, data)?;
             } else {
                 buf.write_bytes_with_length(Some(data))?;

@@ -699,7 +699,7 @@ impl DataTypesMessage {
     }
 
     fn should_send_data_type(caps: &Capabilities, dt: DataTypeDefinition) -> bool {
-        if caps.ttc_field_version != crate::constants::ccap_value::FIELD_VERSION_11_2 {
+        if !caps.is_legacy_11g_ttc() {
             return true;
         }
 
@@ -747,7 +747,7 @@ impl DataTypesMessage {
         payload.write_u16_le(crate::constants::charset::UTF8)?;
 
         // Encoding flags
-        let encoding_flags = if caps.protocol_version == 314 {
+        let encoding_flags = if caps.protocol_version == crate::constants::version::MIN_ACCEPTED {
             LEGACY_11G_ENCODING_FLAGS
         } else {
             encoding::MULTI_BYTE | encoding::CONV_LENGTH

@@ -519,7 +519,7 @@ impl<'a> ExecuteMessage<'a> {
         let stmt = self.statement;
         let opts = &self.options;
 
-        caps.ttc_field_version == ccap_value::FIELD_VERSION_11_2
+        caps.is_legacy_11g_ttc()
             && stmt.is_query()
             && stmt.cursor_id() == 0
             && !stmt.sql().is_empty()
@@ -539,7 +539,7 @@ impl<'a> ExecuteMessage<'a> {
         let stmt = self.statement;
         let opts = &self.options;
 
-        caps.ttc_field_version == ccap_value::FIELD_VERSION_11_2
+        caps.is_legacy_11g_ttc()
             && stmt.is_query()
             && stmt.cursor_id() != 0
             && stmt.sql().is_empty()
@@ -623,7 +623,7 @@ impl<'a> ExecuteMessage<'a> {
         caps: &Capabilities,
         sql: &[u8],
     ) -> Result<()> {
-        if caps.ttc_field_version > ccap_value::FIELD_VERSION_11_2 {
+        if !caps.is_legacy_11g_ttc() {
             return buf.write_bytes_with_length(Some(sql));
         }
 
@@ -686,6 +686,12 @@ impl<'a> ExecuteMessage<'a> {
         buf.write_u8(0)?;
         buf.write_u8(1)?;
 
+        // NOTE: this function is only reached via should_use_legacy_11g_fetch_layout,
+        // where caps.is_legacy_11g_ttc() holds and ttc_field_version == FIELD_VERSION_11_2 (6).
+        // FIELD_VERSION_11_2 is the lowest defined value, so `>= FIELD_VERSION_11_2` is
+        // always true here (these five bytes are always written for 11g); the following
+        // `>= 12_1 / 12_2 / 18_1` gates are always false. Left byte-for-byte as-is to
+        // preserve the exact 11g wire layout — see Capabilities::is_legacy_11g_ttc.
         if caps.ttc_field_version >= ccap_value::FIELD_VERSION_11_2 {
             buf.write_u8(0)?;
             buf.write_u8(0)?;

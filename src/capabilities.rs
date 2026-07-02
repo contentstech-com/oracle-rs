@@ -257,7 +257,7 @@ impl Capabilities {
 
     /// Adjust capabilities based on server's runtime capabilities
     pub fn adjust_for_server_runtime_caps(&mut self, server_caps: &[u8]) {
-        if self.protocol_version != 0 && self.protocol_version <= version::MIN_ACCEPTED {
+        if self.is_legacy_11g_protocol() {
             self.max_string_size = 4000;
             self.supports_request_boundaries = false;
             return;
@@ -297,6 +297,29 @@ impl Capabilities {
     /// Check if we support large OSON field names (Oracle 23.1+)
     pub fn supports_large_oson_fname(&self) -> bool {
         self.ttc_field_version >= ccap_value::FIELD_VERSION_23_1
+    }
+
+    /// Whether the server requires the legacy Oracle 11g TTC wire layout,
+    /// keyed off the negotiated `ttc_field_version`.
+    ///
+    /// `FIELD_VERSION_11_2` (6) is the lowest value defined in
+    /// [`ccap_value`](crate::constants::ccap_value), so `<= FIELD_VERSION_11_2`
+    /// and `== FIELD_VERSION_11_2` are currently equivalent. `<=` is chosen as
+    /// the canonical, forward-safe form. This consolidates the predicate that
+    /// was previously hand-rolled with `==`, `<=`, `!=`, and `>` semantics
+    /// across auth, execute, lob_op, data_types, and connection.
+    pub fn is_legacy_11g_ttc(&self) -> bool {
+        self.ttc_field_version <= ccap_value::FIELD_VERSION_11_2
+    }
+
+    /// Whether the negotiated protocol version corresponds to a legacy Oracle
+    /// 11g server (TNS `MIN_ACCEPTED` = 314, the oldest version we accept).
+    ///
+    /// The `!= 0` guard matches the idiom already used in
+    /// [`Self::adjust_for_server_runtime_caps`]: a `protocol_version` of 0 means
+    /// "not yet negotiated" and must not be treated as legacy.
+    pub fn is_legacy_11g_protocol(&self) -> bool {
+        self.protocol_version != 0 && self.protocol_version <= version::MIN_ACCEPTED
     }
 }
 

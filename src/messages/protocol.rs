@@ -76,7 +76,7 @@ impl ProtocolMessage {
         // Reserve space for packet header
         buf.write_zeros(PACKET_HEADER_SIZE)?;
 
-        if caps.protocol_version == 314 {
+        if caps.protocol_version == crate::constants::version::MIN_ACCEPTED {
             // Oracle 11g expects the legacy Set Protocol layout captured from OCI:
             // accepted TTC versions followed by the client platform string.
             buf.write_u16_be(0x2000)?;

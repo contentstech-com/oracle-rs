@@ -2390,6 +2390,10 @@ mod json_tests {
     #[ignore = "requires Oracle database with JSON support (21c+)"]
     async fn test_json_select_simple() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "JSON_OBJECT / native JSON (12c+)").await {
+            conn.close().await.ok();
+            return;
+        }
 
         // JSON_OBJECT returns VARCHAR2 by default, which is fine for older Oracle versions
         // Native JSON type columns are only available in Oracle 21c+
@@ -4943,6 +4947,10 @@ mod json_nesting_tests {
     #[ignore = "requires Oracle database with JSON support (21c+)"]
     async fn test_json_nested_objects_and_arrays() {
         let conn = connect().await.expect("Failed to connect");
+        if skip_on_11g(&conn, "native JSON type (21c+)").await {
+            conn.close().await.ok();
+            return;
+        }
 
         conn.execute(
             "BEGIN EXECUTE IMMEDIATE 'CREATE TABLE json_nested_test (id NUMBER PRIMARY KEY, data JSON)'; EXCEPTION WHEN OTHERS THEN IF SQLCODE != -955 THEN RAISE; END IF; END;",

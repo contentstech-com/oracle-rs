@@ -237,7 +237,7 @@ impl AuthMessage {
 
     /// Build phase one request (username and session info)
     fn build_phase_one(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
-        if Self::is_legacy_11g(caps) {
+        if caps.is_legacy_11g_ttc() {
             return self.build_legacy_11g_phase_one(large_sdu);
         }
 
@@ -311,7 +311,7 @@ impl AuthMessage {
             .ok_or_else(|| Error::Protocol("Client session key not generated".to_string()))?;
         let pairs = self.build_phase_two_pairs(caps, &encoded_password, session_key)?;
 
-        if Self::is_legacy_11g(caps) {
+        if caps.is_legacy_11g_ttc() {
             return self.build_legacy_11g_phase_two(large_sdu, &pairs);
         }
 
@@ -395,7 +395,7 @@ impl AuthMessage {
 
         pairs.push(("AUTH_PASSWORD", encoded_password.to_string(), 0));
 
-        if caps.ttc_field_version == crate::constants::ccap_value::FIELD_VERSION_11_2 {
+        if caps.is_legacy_11g_ttc() {
             pairs.push(("AUTH_RTT", "0".to_string(), 0));
             pairs.push(("AUTH_CLNT_MEM", "4096".to_string(), 0));
             pairs.push(("AUTH_TERMINAL", self.legacy_11g_terminal(), 0));
@@ -483,10 +483,6 @@ impl AuthMessage {
         }
 
         Self::finalize_packet(buf, large_sdu)
-    }
-
-    fn is_legacy_11g(caps: &Capabilities) -> bool {
-        caps.ttc_field_version == crate::constants::ccap_value::FIELD_VERSION_11_2
     }
 
     fn write_legacy_11g_pointer(buf: &mut WriteBuffer) -> Result<()> {
