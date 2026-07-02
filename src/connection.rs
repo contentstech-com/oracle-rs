@@ -49,7 +49,7 @@ use crate::messages::{
     AcceptMessage, AuthMessage, AuthPhase, ConnectMessage, ExecuteMessage, ExecuteOptions,
     FetchMessage, LobOpMessage,
 };
-use crate::packet::{Packet, PacketHeader};
+use crate::packet::Packet;
 use crate::row::{Row, Value};
 use crate::statement::{BindParam, ColumnInfo, Statement, StatementType};
 use crate::statement_cache::StatementCache;
@@ -231,8 +231,6 @@ pub struct ServerInfo {
     pub session_id: u32,
     /// Serial number
     pub serial_number: u32,
-    /// Failover ID
-    pub failover_id: u32,
     /// Instance name
     pub instance_name: Option<String>,
     /// Service name
@@ -1035,7 +1033,24 @@ impl Connection {
         result
     }
 
-    async fn update_fetch_seed_row(&self, cursor_id: u16, rows: &[Row], has_more_rows: bool) {
+    /// Record the BitVector duplicate-column decompression seed (the last row
+    /// values seen) for a cursor, so the first row of the next fetch batch can
+    /// be reconstructed against it.
+    ///
+    /// `is_initial` must be true when this is called for a fresh (re-)execute
+    /// and false for a fetch continuation. On a fresh execute that returns no
+    /// prefetched rows, any seed left over from a previous execution of the
+    /// same (reused) cursor id must be dropped: the next fetch starts at the
+    /// first row of a brand new result set and has no previous-row seed.
+    /// Leaving a continuation's stale seed in place there is only safe because a
+    /// continuation that reports more rows but returns none has not advanced.
+    async fn update_fetch_seed_row(
+        &self,
+        cursor_id: u16,
+        rows: &[Row],
+        has_more_rows: bool,
+        is_initial: bool,
+    ) {
         if cursor_id == 0 {
             return;
         }
@@ -1045,6 +1060,8 @@ impl Connection {
                 inner
                     .fetch_seed_rows
                     .insert(cursor_id, last_row.values().to_vec());
+            } else if is_initial {
+                inner.fetch_seed_rows.remove(&cursor_id);
             }
         } else {
             inner.fetch_seed_rows.remove(&cursor_id);
@@ -1330,8 +1347,7 @@ impl Connection {
 
         // Build data types request using DataTypesMessage (includes all ~320 data types)
         let data_types_msg = DataTypesMessage::new();
-        let (packet, continuation) =
-            data_types_msg.build_request_with_continuation(&inner.capabilities, large_sdu)?;
+        let packet = data_types_msg.build_request(&inner.capabilities, large_sdu)?;
         if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
             eprintln!(
                 "oracle-rs data-types request ({} bytes): {}",
@@ -1340,19 +1356,9 @@ impl Connection {
             );
         }
         inner.send(&packet).await?;
-        if let Some(ref continuation_packet) = continuation {
-            if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
-                eprintln!(
-                    "oracle-rs data-types continuation request ({} bytes): {}",
-                    continuation_packet.len(),
-                    hex::encode(continuation_packet.as_ref())
-                );
-            }
-            inner.send(continuation_packet).await?;
-        }
 
         // Receive response
-        let mut response = inner.receive().await?;
+        let response = inner.receive().await?;
         if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
             eprintln!(
                 "oracle-rs data-types response ({} bytes): {}",
@@ -1361,34 +1367,16 @@ impl Connection {
             );
         }
 
-        if continuation.is_some()
-            && response.len() > PACKET_HEADER_SIZE
-            && response[4] == PacketType::Data as u8
-        {
-            let payload = &response[PACKET_HEADER_SIZE..];
-            if matches!(
-                data_types_msg.parse_response(payload),
-                Err(Error::BufferUnderflow { .. })
-            ) {
-                let continuation_response = inner.receive().await?;
-                if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
-                    eprintln!(
-                        "oracle-rs data-types continuation response ({} bytes): {}",
-                        continuation_response.len(),
-                        hex::encode(continuation_response.as_ref())
-                    );
-                }
-                response = Self::combine_data_packets(
-                    response.as_ref(),
-                    continuation_response.as_ref(),
-                    large_sdu,
-                )?;
-            }
-        }
-
-        // Basic validation - packet type is at offset 4 regardless of large_sdu
+        // Basic validation - packet type is at offset 4 regardless of large_sdu.
+        //
+        // The server echoes back the negotiated data types. That echo is
+        // advisory: its parsed contents are not consumed anywhere, and the
+        // request is always a single packet (build_request never produces a
+        // continuation). We therefore only confirm this is a DATA packet and
+        // deliberately do not parse the echoed type list, matching the
+        // pre-11g behavior and tolerating server-specific layout differences
+        // (e.g. Oracle 11g) rather than hard-failing connect() on a parse error.
         if response.len() > 4 && response[4] == PacketType::Data as u8 {
-            data_types_msg.parse_response(&response[PACKET_HEADER_SIZE..])?;
             inner.state = ConnectionState::DataTypesNegotiated;
             Ok(())
         } else {
@@ -1536,41 +1524,11 @@ impl Connection {
         if let Some(combo_key) = auth.combo_key() {
             inner.capabilities.combo_key = Some(combo_key.to_vec());
         }
-        if let Some((session_id, serial_number, failover_id)) = session_identifiers {
+        if let Some((session_id, serial_number, _failover_id)) = session_identifiers {
             inner.server_info.session_id = session_id;
             inner.server_info.serial_number = serial_number;
-            inner.server_info.failover_id = failover_id;
         }
-        let enable_legacy_11g_sequence_alignment = inner.server_info.protocol_version == 314
-            && (std::env::var_os("ORACLE_RS_SEND_11G_SESSION_SWITCH").is_some()
-                || std::env::var_os("ORACLE_RS_WRAP_11G_EXECUTE").is_some());
-        // Allow targeted 11g sequencing experiments without changing the
-        // normal state machine for other servers.
-        inner.sequence_number = std::env::var("ORACLE_RS_POST_AUTH_SEQUENCE")
-            .ok()
-            .and_then(|raw| raw.parse::<u8>().ok())
-            .unwrap_or(if enable_legacy_11g_sequence_alignment {
-                4
-            } else {
-                2
-            });
-        if inner.server_info.protocol_version == 314
-            && std::env::var_os("ORACLE_RS_SEND_11G_SESSION_SWITCH").is_some()
-        {
-            let (session_id, serial_number, failover_id) =
-                session_identifiers.ok_or_else(|| {
-                    Error::Protocol(
-                        "missing 11g session identifiers for session switch".to_string(),
-                    )
-                })?;
-            Self::send_legacy_11g_session_switch(
-                &mut inner,
-                session_id,
-                serial_number,
-                failover_id,
-            )
-            .await?;
-        }
+        inner.sequence_number = 2;
 
         if inner.server_info.protocol_version <= 314 {
             let mut ver_buf = crate::buffer::WriteBuffer::with_capacity(32);
@@ -1596,111 +1554,6 @@ impl Connection {
         inner.state = ConnectionState::Ready;
 
         Ok(())
-    }
-
-    async fn send_legacy_11g_session_switch(
-        inner: &mut ConnectionInner,
-        session_id: u32,
-        serial_number: u32,
-        failover_id: u32,
-    ) -> Result<()> {
-        let seq_num = std::env::var("ORACLE_RS_11G_SESSION_SWITCH_SEQUENCE")
-            .ok()
-            .and_then(|raw| raw.parse::<u8>().ok())
-            .unwrap_or_else(|| inner.next_sequence_number());
-
-        let mut packet = WriteBuffer::with_capacity(PACKET_HEADER_SIZE + 48);
-        if inner.large_sdu {
-            packet.write_u32_be((PACKET_HEADER_SIZE + 48) as u32)?;
-        } else {
-            packet.write_u16_be((PACKET_HEADER_SIZE + 48) as u16)?;
-            packet.write_u16_be(0)?;
-        }
-        packet.write_u8(PacketType::Data as u8)?;
-        packet.write_u8(0)?;
-        packet.write_u16_be(0)?;
-        packet.write_u16_be(0x2000)?;
-        packet.write_u8(0x11)?;
-        packet.write_u8(0x6b)?;
-        packet.write_u8(0x04)?;
-        packet.write_bytes(&session_id.to_le_bytes())?;
-        packet.write_bytes(&serial_number.to_le_bytes())?;
-        packet.write_bytes(&failover_id.to_le_bytes())?;
-        packet.write_u8(0x03)?;
-        packet.write_u8(0x3b)?;
-        packet.write_u8(seq_num)?;
-        packet.write_bytes(&(-2i64).to_le_bytes())?;
-        packet.write_bytes(&512u32.to_le_bytes())?;
-        packet.write_bytes(&(-2i64).to_le_bytes())?;
-        packet.write_bytes(&(-2i64).to_le_bytes())?;
-        let packet = packet.freeze();
-
-        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
-            eprintln!(
-                "oracle-rs 11g session-switch request ({} bytes): {}",
-                packet.len(),
-                hex::encode(packet.as_ref())
-            );
-        }
-
-        inner.send(&packet).await?;
-        let response = inner.receive().await?;
-
-        if std::env::var_os("ORACLE_RS_DEBUG_HANDSHAKE").is_some() {
-            eprintln!(
-                "oracle-rs 11g session-switch response ({} bytes): {}",
-                response.len(),
-                hex::encode(response.as_ref())
-            );
-        }
-
-        if response.len() > 4 && response[4] == 12 {
-            return Err(Error::Protocol(
-                "legacy 11g session-switch piggyback was rejected".to_string(),
-            ));
-        }
-
-        inner.sequence_number = seq_num;
-
-        Ok(())
-    }
-
-    fn wrap_legacy_11g_execute_request(
-        inner: &ConnectionInner,
-        request: &[u8],
-        session_id: u32,
-        serial_number: u32,
-        failover_id: u32,
-    ) -> Result<Bytes> {
-        if request.len() <= PACKET_HEADER_SIZE + 2 {
-            return Err(Error::Protocol(
-                "Oracle 11g wrapped execute request is too short".to_string(),
-            ));
-        }
-
-        let inner_payload = &request[PACKET_HEADER_SIZE + 2..];
-        let total_len = PACKET_HEADER_SIZE + 2 + 1 + 1 + 1 + 4 + 4 + 4 + inner_payload.len();
-        let mut packet = WriteBuffer::with_capacity(total_len);
-
-        if inner.large_sdu {
-            packet.write_u32_be(total_len as u32)?;
-        } else {
-            packet.write_u16_be(total_len as u16)?;
-            packet.write_u16_be(0)?;
-        }
-        packet.write_u8(PacketType::Data as u8)?;
-        packet.write_u8(0)?;
-        packet.write_u16_be(0)?;
-        packet.write_u16_be(0x2000)?;
-        packet.write_u8(0x11)?;
-        packet.write_u8(0x6b)?;
-        packet.write_u8(0x04)?;
-        packet.write_bytes(&session_id.to_le_bytes())?;
-        packet.write_bytes(&serial_number.to_le_bytes())?;
-        packet.write_bytes(&failover_id.to_le_bytes())?;
-        packet.write_bytes(inner_payload)?;
-
-        Ok(packet.freeze())
     }
 
     /// Execute a SQL statement and return the result
@@ -1759,6 +1612,19 @@ impl Connection {
             if let Err(err) = self.fetch_initial_11g_query_rows(query_result).await {
                 result = Err(err);
             }
+        }
+
+        // Seed (or reset) the BitVector decompression seed for this cursor, so a
+        // following fetch_more() against execute()-prefetched rows decompresses
+        // correctly and a re-execute never inherits a prior execution's seed.
+        if let Ok(ref query_result) = result {
+            self.update_fetch_seed_row(
+                query_result.cursor_id,
+                &query_result.rows,
+                query_result.has_more_rows,
+                true,
+            )
+            .await;
         }
 
         // Return statement to cache or cache it for the first time
@@ -1864,6 +1730,7 @@ impl Connection {
                 query_result.cursor_id,
                 &query_result.rows,
                 query_result.has_more_rows,
+                true,
             )
             .await;
         }
@@ -2431,7 +2298,7 @@ impl Connection {
         if legacy_11g && !result.has_more_rows && result.rows.len() == fetch_size as usize {
             result.has_more_rows = true;
         }
-        self.update_fetch_seed_row(result.cursor_id, &result.rows, result.has_more_rows)
+        self.update_fetch_seed_row(result.cursor_id, &result.rows, result.has_more_rows, false)
             .await;
         Ok(result)
     }
@@ -2559,7 +2426,7 @@ impl Connection {
         if legacy_11g && !result.has_more_rows && result.rows.len() == fetch_size as usize {
             result.has_more_rows = true;
         }
-        self.update_fetch_seed_row(result.cursor_id, &result.rows, result.has_more_rows)
+        self.update_fetch_seed_row(result.cursor_id, &result.rows, result.has_more_rows, false)
             .await;
         Ok(result)
     }
@@ -3015,6 +2882,13 @@ impl Connection {
             return Ok(());
         }
 
+        // Drop any BitVector decompression seed held for this cursor id so it
+        // cannot be served to a later fetch on a reused cursor id.
+        {
+            let mut inner = self.inner.lock().await;
+            inner.fetch_seed_rows.remove(&cursor.cursor_id());
+        }
+
         // Send close cursor message
         // For now, just mark it as closed - the cursor will be cleaned up
         // when the connection is closed or reused
@@ -3130,17 +3004,13 @@ impl Connection {
             let inner = self.inner.lock().await;
             inner.server_info.protocol_version
         };
-        let prefetch_rows: u32 = if protocol_version <= 314 {
-            std::env::var("ORACLE_RS_PREFETCH_ROWS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
-        } else {
-            std::env::var("ORACLE_RS_PREFETCH_ROWS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100)
-        };
+        // 11g cannot detect multi-packet end-of-response, so it defaults to no
+        // prefetch (rows fetched via fetch_more()); newer servers prefetch 100.
+        let default_prefetch_rows: u32 = if protocol_version <= 314 { 0 } else { 100 };
+        let prefetch_rows: u32 = std::env::var("ORACLE_RS_PREFETCH_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(default_prefetch_rows);
 
         let options = ExecuteOptions::for_query(prefetch_rows);
         let mut execute_msg = ExecuteMessage::new(statement, options);
@@ -3158,24 +3028,7 @@ impl Connection {
             inner.next_sequence_number()
         };
         execute_msg.set_sequence_number(sequence_number);
-        let mut request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
-        if inner.server_info.protocol_version == 314
-            && std::env::var_os("ORACLE_RS_WRAP_11G_EXECUTE").is_some()
-            && statement.cursor_id() == 0
-        {
-            if inner.server_info.session_id == 0 || inner.server_info.serial_number == 0 {
-                return Err(Error::Protocol(
-                    "Oracle 11g wrapped execute requires session identifiers".to_string(),
-                ));
-            }
-            request = Self::wrap_legacy_11g_execute_request(
-                &inner,
-                request.as_ref(),
-                inner.server_info.session_id,
-                inner.server_info.serial_number,
-                inner.server_info.failover_id,
-            )?;
-        }
+        let request = execute_msg.build_request_with_sdu(&inner.capabilities, large_sdu)?;
         if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
             eprintln!(
                 "oracle-rs query request ({} bytes): {}",
@@ -4899,50 +4752,16 @@ impl Connection {
                 }
             }
 
-            // Extended error number (UB4) + row count (UB8)
+            // Extended error number (UB4) + row count (UB8).
             // Oracle 11g (ttc_field_version == 6) does not send these fields;
-            // the error message follows directly after the batch arrays.
-            let saved_pos = buf.position();
-            let error_num = match buf.read_ub4() {
-                Ok(v) => {
-                    if v != 0 {
-                        v
-                    } else {
-                        error_num_short
-                    }
-                }
-                Err(Error::InvalidLengthIndicator(_) | Error::BufferUnderflow { .. }) => {
-                    let _ = buf.set_position(saved_pos);
-                    error_num_short
-                }
-                Err(e) => return Err(e),
-            };
-
-            // Only read row_count when we successfully consumed the extended
-            // error code (position advanced past saved_pos).
-            if buf.position() > saved_pos {
-                let _ = buf.read_ub8();
-            }
+            // the error message follows directly after the batch arrays. These
+            // two helpers rewind and fall back exactly as needed for both the
+            // 11g short-error layout and the modern extended-error layout.
+            let (error_num, _row_count, _read_extended_info) =
+                self.read_optional_extended_error_info(&mut buf, error_num_short, 0)?;
 
             // Read error message
-            let error_msg = if error_num != 0 {
-                match buf.read_string_with_length() {
-                    Ok(message) => message.map(|s| s.trim().to_string()),
-                    Err(Error::InvalidLengthIndicator(_)) => {
-                        let raw = String::from_utf8_lossy(buf.remaining_bytes())
-                            .trim()
-                            .to_string();
-                        if raw.is_empty() {
-                            None
-                        } else {
-                            Some(raw)
-                        }
-                    }
-                    Err(err) => return Err(err),
-                }
-            } else {
-                None
-            };
+            let error_msg = self.read_optional_error_message(&mut buf, error_num)?;
 
             return Err(Error::OracleError {
                 code: error_num,
@@ -5421,34 +5240,6 @@ impl Connection {
         }
 
         None
-    }
-
-    fn combine_data_packets(first: &[u8], second: &[u8], large_sdu: bool) -> Result<Bytes> {
-        if first.len() < PACKET_HEADER_SIZE + 2 || second.len() < PACKET_HEADER_SIZE + 2 {
-            return Err(Error::PacketTooShort {
-                expected: PACKET_HEADER_SIZE + 2,
-                actual: first.len().min(second.len()),
-            });
-        }
-        if first[4] != PacketType::Data as u8 || second[4] != PacketType::Data as u8 {
-            return Err(Error::ProtocolError(
-                "Cannot combine non-DATA packets during 11g data-types negotiation".to_string(),
-            ));
-        }
-
-        let mut payload =
-            Vec::with_capacity(first.len() + second.len() - (PACKET_HEADER_SIZE * 2) - 2);
-        payload.extend_from_slice(&first[PACKET_HEADER_SIZE..]);
-        payload.extend_from_slice(&second[PACKET_HEADER_SIZE + 2..]);
-
-        let total_len = (PACKET_HEADER_SIZE + payload.len()) as u32;
-        let header = PacketHeader::new(PacketType::Data, total_len);
-        let mut header_buf = WriteBuffer::with_capacity(PACKET_HEADER_SIZE);
-        header.write(&mut header_buf, large_sdu)?;
-
-        let mut result = header_buf.into_inner().to_vec();
-        result.extend_from_slice(&payload);
-        Ok(Bytes::from(result))
     }
 
     /// Read data from a LOB (CLOB or BLOB)

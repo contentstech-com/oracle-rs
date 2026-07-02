@@ -217,8 +217,6 @@ pub enum FunctionCode {
     TpcTxnChangeState = 104,
     /// Close cursors
     CloseCursors = 105,
-    /// Session switching piggyback (V8)
-    SessionSwitchPiggyback = 107,
     /// Authentication phase one
     AuthPhaseOne = 118,
     /// Authentication phase two

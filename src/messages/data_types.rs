@@ -736,15 +736,6 @@ impl DataTypesMessage {
         Ok(result.freeze())
     }
 
-    /// Build the DataTypes request packet and optional continuation packet.
-    pub fn build_request_with_continuation(
-        &self,
-        caps: &Capabilities,
-        large_sdu: bool,
-    ) -> Result<(Bytes, Option<Bytes>)> {
-        Ok((self.build_semantic_request(caps, large_sdu)?, None))
-    }
-
     fn build_semantic_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
         let mut payload = WriteBuffer::with_capacity(4096);
 
@@ -789,8 +780,7 @@ impl DataTypesMessage {
 
     /// Build the DataTypes request packet
     pub fn build_request(&self, caps: &Capabilities, large_sdu: bool) -> Result<Bytes> {
-        let (request, _continuation) = self.build_request_with_continuation(caps, large_sdu)?;
-        Ok(request)
+        self.build_semantic_request(caps, large_sdu)
     }
 
     /// Parse the DataTypes response
