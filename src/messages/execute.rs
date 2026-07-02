@@ -294,8 +294,13 @@ impl<'a> ExecuteMessage<'a> {
             exec_opts |= exec_option::DEFINE;
         } else if !opts.describe_only && !stmt.sql().is_empty() {
             // REF CURSORs have no SQL and should not set execute flags here.
-            // IMPLICIT_RESULTSET is only needed for PL/SQL implicit result sets
-            // and causes compatibility issues with Oracle 11g queries.
+            // IMPLICIT_RESULTSET signals support for DBMS_SQL.RETURN_RESULT
+            // implicit result sets (a 12.1 feature). It must NOT be set on the
+            // legacy Oracle 11g path, where it causes query compatibility
+            // issues, so gate it on the 12.1+ TTC field version.
+            if caps.ttc_field_version >= ccap_value::FIELD_VERSION_12_1 {
+                exec_flgs |= exec_flags::IMPLICIT_RESULTSET;
+            }
             if opts.execute && !opts.scroll_operation {
                 exec_opts |= exec_option::EXECUTE;
             }
@@ -1471,6 +1476,40 @@ mod tests {
         assert!(
             !packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
             "Oracle 11g execute packets must not advertise DML row-count flags"
+        );
+    }
+
+    #[test]
+    fn test_implicit_resultset_flag_gated_by_ttc_version() {
+        // IMPLICIT_RESULTSET (0x8000) is written as the al8i4[9] execute flags
+        // field via write_ub4, which TNS-encodes 0x8000 as [0x02, 0x80, 0x00].
+        let encoded_flag = [0x02, 0x80, 0x00];
+
+        // Modern server (>= 12.1): the flag must be advertised so that
+        // DBMS_SQL.RETURN_RESULT implicit result sets work.
+        let stmt = Statement::new("SELECT 1 FROM DUAL");
+        let opts = ExecuteOptions::for_query(100);
+        let msg = ExecuteMessage::new(&stmt, opts);
+        let mut modern_caps = Capabilities::new();
+        modern_caps.ttc_field_version = ccap_value::FIELD_VERSION_12_1;
+        let modern_packet = msg.build_request(&modern_caps).unwrap();
+        assert!(
+            modern_packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
+            "Modern (>= 12.1) execute packets must advertise IMPLICIT_RESULTSET"
+        );
+
+        // Legacy Oracle 11g (FIELD_VERSION_11_2): the flag must NOT be set,
+        // as it causes query compatibility issues on 11g.
+        let stmt = Statement::new("SELECT 1 FROM DUAL");
+        let opts = ExecuteOptions::for_query(100);
+        let msg = ExecuteMessage::new(&stmt, opts);
+        let mut legacy_caps = Capabilities::new();
+        legacy_caps.protocol_version = 314;
+        legacy_caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+        let legacy_packet = msg.build_request(&legacy_caps).unwrap();
+        assert!(
+            !legacy_packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
+            "Oracle 11g execute packets must not advertise IMPLICIT_RESULTSET"
         );
     }
 

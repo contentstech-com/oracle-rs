@@ -207,10 +207,7 @@ impl ProtocolMessage {
     }
 
     fn legacy_11g_client_platform() -> String {
-        std::env::var("ORACLE_RS_11G_CLIENT_PLATFORM")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "MACOS_aarch64/OSX-22.3.0-Darwin".to_string())
+        "MACOS_aarch64/OSX-22.3.0-Darwin".to_string()
     }
 }
 

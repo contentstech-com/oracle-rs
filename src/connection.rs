@@ -459,24 +459,69 @@ impl ConnectionInner {
     ) -> Result<bytes::Bytes> {
         use crate::constants::{data_flags, MessageType};
 
+        let legacy_11g = self.server_info.protocol_version <= 314;
+        let is_lob = lob_parameter_body_len.is_some();
+        // Hoisted once instead of re-reading the environment on every packet.
+        let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
+
+        // Fast path: modern protocol (> 314), non-LOB response.
+        //
+        // Before Oracle 11g support was added, query/fetch/cursor/define
+        // responses were read with a single receive(): modern servers negotiate
+        // a large SDU and deliver each describe/prefetch/fetch batch in one TNS
+        // data packet, so no accumulation is required. Crucially, servers below
+        // TTC 23.4 (protocols 315-318, i.e. 12c-19c) do NOT set the
+        // END_OF_RESPONSE data flag, and row/describe streams carry no in-band
+        // terminator that the inspector below can recognise. An accumulation
+        // loop therefore has no reliable stop condition for these responses and
+        // would block forever on a complete response whose final packet happens
+        // to fill the SDU exactly. Restoring the single-receive semantics for
+        // modern protocols avoids that hang and matches long-standing behaviour;
+        // the callers already handle MARKER packets and short responses.
+        if !legacy_11g && !is_lob {
+            return self.receive().await;
+        }
+
         let mut accumulated_payload = Vec::new();
         let mut is_first_packet = true;
-        let legacy_11g = self.server_info.protocol_version <= 314;
-        let legacy_idle_timeout = std::time::Duration::from_secs(2);
-        let mut requires_continuation = false;
+        let idle_timeout = std::time::Duration::from_secs(2);
+        // Byte offset (into accumulated_payload[2..]) up to which the message
+        // stream has already been fully parsed as complete messages, plus the
+        // running saw_lob_data flag. These let the inspector resume from the
+        // frontier each packet instead of re-scanning the whole payload (which
+        // was O(N^2) for multi-packet LOB reads).
+        let mut scan_offset = 0usize;
+        let mut saw_lob_data = false;
+        // True once the inspector has proven the stream ends mid-message and we
+        // must keep reading to complete it.
+        let mut incomplete = false;
 
         loop {
-            let packet = if requires_continuation || (legacy_11g && !is_first_packet) {
-                match tokio::time::timeout(legacy_idle_timeout, self.receive()).await {
+            // Choosing how to wait for the next packet:
+            //
+            // * When the stream is known to be mid-message (`incomplete`), we
+            //   MUST block until the rest arrives. Turning slowness into an
+            //   error here would discard valid accumulated data and desync the
+            //   connection (the previous code raised a fatal 2s ConnectionTimeout
+            //   in this situation). Blocking on genuinely incomplete data is the
+            //   correct behaviour.
+            // * On 11g (protocol 314) the server never sets END_OF_RESPONSE and
+            //   row streams have no terminator we parse, so an idle timeout is
+            //   used ONLY as a soft "no more packets are coming" signal. Its
+            //   expiry is treated as end-of-response (break and return the data
+            //   accumulated so far), never as an error.
+            let packet = if !incomplete && legacy_11g && !is_first_packet {
+                match tokio::time::timeout(idle_timeout, self.receive()).await {
                     Ok(result) => result?,
                     Err(_) => {
-                        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+                        if debug {
                             eprintln!(
-                                "oracle-rs receive_response: continuation timeout after {} bytes",
+                                "oracle-rs receive_response: 11g idle timeout, treating \
+                                 {} accumulated bytes as complete response",
                                 accumulated_payload.len()
                             );
                         }
-                        return Err(Error::ConnectionTimeout(legacy_idle_timeout));
+                        break;
                     }
                 }
             } else {
@@ -526,24 +571,31 @@ impl ConnectionInner {
 
             // Inspect the accumulated message data for either a terminal
             // message or a message that is clearly still split across packets.
+            // The scan resumes from the previously parsed frontier so repeated
+            // calls stay linear in the total payload size.
             let (has_terminal_message, has_incomplete_message) =
                 if !is_end_of_response && accumulated_payload.len() > 2 {
-                    if lob_parameter_body_len.is_some() {
-                        self.inspect_message_stream_with_lob_parameter_len(
-                            &accumulated_payload[2..],
-                            lob_parameter_body_len,
-                        )
-                    } else {
-                        self.inspect_message_stream(&accumulated_payload[2..])
-                    }
+                    self.inspect_message_stream_resumable(
+                        &accumulated_payload[2..],
+                        lob_parameter_body_len,
+                        &mut scan_offset,
+                        &mut saw_lob_data,
+                    )
                 } else {
                     (false, false)
                 };
 
-            if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            // A packet smaller than the SDU often indicates the server has no
+            // more data to send, but LOB data chunks can span such packets, so
+            // 11g LOB reads use extra slack.
+            let short_packet_slack = if legacy_11g && is_lob { 64 } else { 1 };
+            let is_short_packet = (packet.len() + short_packet_slack) < self.sdu_size as usize;
+
+            if debug {
                 eprintln!(
                     "oracle-rs receive_response: packet {} bytes, accumulated {} bytes, \
-                     end_flag={} eof_flag={} end_msg={} terminal={} incomplete={}",
+                     end_flag={} eof_flag={} end_msg={} terminal={} incomplete={} \
+                     short={} (sdu={})",
                     packet.len(),
                     accumulated_payload.len(),
                     has_end_flag,
@@ -551,33 +603,36 @@ impl ConnectionInner {
                     has_end_message,
                     has_terminal_message,
                     has_incomplete_message,
-                );
-            }
-
-            // A packet smaller than the SDU often indicates the server has no
-            // more data to send, but LOB data chunks can span such packets.
-            let short_packet_slack = if legacy_11g && lob_parameter_body_len.is_some() {
-                64
-            } else {
-                1
-            };
-            let is_short_packet = (packet.len() + short_packet_slack) < self.sdu_size as usize;
-            if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
-                eprintln!(
-                    "oracle-rs receive_response: is_short={} (pkt={} sdu={})",
                     is_short_packet,
-                    packet.len(),
                     self.sdu_size,
                 );
             }
 
-            if is_end_of_response
-                || has_terminal_message
-                || (is_short_packet && !has_incomplete_message)
-            {
+            // Deterministic completion signals first.
+            if is_end_of_response || has_terminal_message {
                 break;
             }
-            requires_continuation = has_incomplete_message;
+            // Stream proven to end mid-message: keep reading, and never apply the
+            // short-packet heuristic (which would truncate a split message).
+            if has_incomplete_message {
+                incomplete = true;
+                continue;
+            }
+            incomplete = false;
+            // Heuristic completion. On 11g a short final packet is the usual
+            // signal that the batch is done; the follow-up parse tolerates this
+            // because 11g fetches rows in explicit batches via fetch_more() (with
+            // prefetch_rows=0), so any residual/short packet is re-driven by the
+            // next fetch rather than silently lost. For modern LOB reads the SDU
+            // is large so is_short_packet effectively never fires here and
+            // completion is driven by flags/terminal messages, matching the
+            // pre-existing single-response behaviour.
+            if is_short_packet {
+                break;
+            }
+            // Full-SDU packet, no terminator, stream not flagged incomplete: on
+            // 11g loop and let the idle timeout confirm end-of-response; on other
+            // paths keep reading for the deferred terminal/flag.
         }
 
         // Build a synthetic packet with combined payload
@@ -603,19 +658,55 @@ impl ConnectionInner {
 
     /// Inspect message data for terminal message types and incomplete LOB
     /// chunks. The return value is (has_terminal_message, has_incomplete_message).
+    ///
+    /// Thin non-resumable wrapper retained for unit tests; the receive loop
+    /// calls [`Self::inspect_message_stream_resumable`] directly.
+    #[cfg(test)]
     fn inspect_message_stream(&self, data: &[u8]) -> (bool, bool) {
         self.inspect_message_stream_with_lob_parameter_len(data, None)
     }
 
+    #[cfg(test)]
     fn inspect_message_stream_with_lob_parameter_len(
         &self,
         data: &[u8],
         lob_parameter_body_len: Option<usize>,
     ) -> (bool, bool) {
+        let mut offset = 0usize;
+        let mut saw_lob_data = false;
+        self.inspect_message_stream_resumable(
+            data,
+            lob_parameter_body_len,
+            &mut offset,
+            &mut saw_lob_data,
+        )
+    }
+
+    /// Resumable variant of the message-stream inspector.
+    ///
+    /// `offset` is the byte position within `data` from which to resume scanning;
+    /// on return it is advanced to the end of the last fully-parsed complete
+    /// message so the next call (after more packets have been appended to `data`)
+    /// only scans the newly-arrived bytes. `saw_lob_data` carries the "we have
+    /// already seen LOB data" state across resumes, which matters for correctly
+    /// classifying the trailing PARAMETER message of a LOB response.
+    ///
+    /// Bytes before `offset` are never rewound: they contain only complete,
+    /// already-classified non-terminal messages (terminal messages and
+    /// incomplete tails always cause an early return without advancing past
+    /// them), so resuming from the frontier is equivalent to a full re-scan but
+    /// runs in linear rather than quadratic total time.
+    fn inspect_message_stream_resumable(
+        &self,
+        data: &[u8],
+        lob_parameter_body_len: Option<usize>,
+        offset: &mut usize,
+        saw_lob_data: &mut bool,
+    ) -> (bool, bool) {
         use crate::buffer::ReadBuffer;
 
-        let mut buf = ReadBuffer::from_slice(data);
-        let mut saw_lob_data = false;
+        let base = (*offset).min(data.len());
+        let mut buf = ReadBuffer::from_slice(&data[base..]);
 
         while buf.remaining() > 0 {
             let msg_type = match buf.read_u8() {
@@ -630,7 +721,7 @@ impl ConnectionInner {
                 return (true, false);
             }
 
-            if msg_type == MessageType::Parameter as u8 && saw_lob_data {
+            if msg_type == MessageType::Parameter as u8 && *saw_lob_data {
                 if let Some(body_len) = lob_parameter_body_len {
                     match buf.skip(body_len) {
                         Ok(_) => return (false, false),
@@ -643,7 +734,7 @@ impl ConnectionInner {
             }
 
             if msg_type == MessageType::LobData as u8 {
-                saw_lob_data = true;
+                *saw_lob_data = true;
                 let lob_data_result = if self.server_info.protocol_version <= 314 {
                     Self::skip_legacy_11g_lob_data(&mut buf)
                 } else {
@@ -651,21 +742,26 @@ impl ConnectionInner {
                 };
 
                 match lob_data_result {
-                    Ok(_) => continue,
+                    Ok(_) => {
+                        // This LOB chunk was fully consumed; advance the resume
+                        // frontier so the next call does not re-skip it.
+                        *offset = base + buf.position();
+                        continue;
+                    }
                     Err(Error::BufferUnderflow { .. } | Error::InvalidLengthIndicator(_)) => {
                         return (false, true);
                     }
                     Err(_) => return (false, false),
                 }
             } else {
-                if saw_lob_data {
+                if *saw_lob_data {
                     return (false, true);
                 }
                 return (false, false);
             }
         }
 
-        if saw_lob_data {
+        if *saw_lob_data {
             return (false, true);
         }
 
@@ -3689,6 +3785,9 @@ impl Connection {
         // Previous row values for copying duplicates
         let mut previous_row_values: Option<Vec<Value>> = None;
 
+        // Hoisted once instead of re-reading the environment on every message.
+        let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
+
         // Process messages until we hit end of response or run out of data.
         // On Oracle 11g a single TNS packet may not contain all rows; when
         // we hit a BufferUnderflow while parsing row data we return what we
@@ -3698,7 +3797,7 @@ impl Connection {
             let msg_pos = buf.position();
             let msg_type = buf.read_u8()?;
 
-            if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            if debug {
                 eprintln!(
                     "oracle-rs query msg_type={} payload_offset={} remaining={}",
                     msg_type,

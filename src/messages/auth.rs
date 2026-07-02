@@ -11,7 +11,7 @@
 //!    Server validates and establishes the session.
 
 use bytes::Bytes;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::buffer::{ReadBuffer, WriteBuffer};
 use crate::capabilities::Capabilities;
@@ -128,47 +128,6 @@ pub struct AuthMessage {
     logical_session_id: String,
     /// Sequence number for protocol messages
     sequence_number: u8,
-}
-
-#[derive(Debug, Default)]
-struct Legacy11gAuthExtras {
-    rtt: bool,
-    clnt_mem: bool,
-    identity: bool,
-    connect_string: bool,
-    lib_type: bool,
-    version_11g: bool,
-    lobattr: bool,
-    acl: bool,
-    logical_session_id: bool,
-    failover_id: bool,
-}
-
-impl Legacy11gAuthExtras {
-    fn from_env() -> Self {
-        let raw = std::env::var("ORACLE_RS_AUTH_PHASE2_EXTRAS").unwrap_or_default();
-        let names: HashSet<String> = raw
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| value.to_ascii_lowercase())
-            .collect();
-
-        let enabled = |name: &str| names.contains("all") || names.contains(name);
-
-        Self {
-            rtt: enabled("rtt"),
-            clnt_mem: enabled("clnt_mem"),
-            identity: enabled("identity"),
-            connect_string: enabled("connect_string"),
-            lib_type: enabled("lib_type"),
-            version_11g: enabled("version_11g"),
-            lobattr: enabled("lobattr"),
-            acl: enabled("acl"),
-            logical_session_id: enabled("logical_session_id"),
-            failover_id: enabled("failover_id"),
-        }
-    }
 }
 
 /// Authentication phase
@@ -437,73 +396,25 @@ impl AuthMessage {
         pairs.push(("AUTH_PASSWORD", encoded_password.to_string(), 0));
 
         if caps.ttc_field_version == crate::constants::ccap_value::FIELD_VERSION_11_2 {
-            let legacy_extras = std::env::var("ORACLE_RS_AUTH_PHASE2_EXTRAS").unwrap_or_default();
-
-            if legacy_extras.trim().is_empty() {
-                pairs.push(("AUTH_RTT", "0".to_string(), 0));
-                pairs.push(("AUTH_CLNT_MEM", "4096".to_string(), 0));
-                pairs.push(("AUTH_TERMINAL", self.legacy_11g_terminal(), 0));
-                pairs.push(("AUTH_PROGRAM_NM", self.legacy_11g_program_name(), 0));
-                pairs.push(("AUTH_MACHINE", self.machine.clone(), 0));
-                pairs.push(("AUTH_PID", self.legacy_11g_pid(), 0));
-                pairs.push(("AUTH_SID", self.osuser.clone(), 0));
-                if let Some(connect_string) = self.build_legacy_11g_connect_string() {
-                    pairs.push(("AUTH_CONNECT_STRING", connect_string, 0));
-                }
-                pairs.push(("SESSION_CLIENT_CHARSET", "873".to_string(), 0));
-                pairs.push(("SESSION_CLIENT_LIB_TYPE", "4".to_string(), 0));
-                pairs.push(("SESSION_CLIENT_DRIVER_NAME", self.legacy_11g_driver_name(), 0));
-                pairs.push(("SESSION_CLIENT_VERSION", "385875968".to_string(), 0));
-                pairs.push(("SESSION_CLIENT_LOBATTR", "1".to_string(), 0));
-                pairs.push(("AUTH_ACL", "8800".to_string(), 0));
-                pairs.push(("AUTH_ALTER_SESSION", self.get_alter_timezone_statement(), 1));
-                pairs.push(("AUTH_LOGICAL_SESSION_ID", self.logical_session_id.clone(), 0));
-                pairs.push(("AUTH_FAILOVER_ID", String::new(), 0));
-            } else {
-                let extras = Legacy11gAuthExtras::from_env();
-
-                if extras.rtt {
-                    pairs.push(("AUTH_RTT", "0".to_string(), 0));
-                }
-                if extras.clnt_mem {
-                    pairs.push(("AUTH_CLNT_MEM", "4096".to_string(), 0));
-                }
-                if extras.identity {
-                    pairs.push(("AUTH_TERMINAL", self.legacy_11g_terminal(), 0));
-                    pairs.push(("AUTH_PROGRAM_NM", self.legacy_11g_program_name(), 0));
-                    pairs.push(("AUTH_MACHINE", self.machine.clone(), 0));
-                    pairs.push(("AUTH_PID", self.legacy_11g_pid(), 0));
-                    pairs.push(("AUTH_SID", self.osuser.clone(), 0));
-                }
-                if extras.connect_string {
-                    if let Some(connect_string) = self.build_legacy_11g_connect_string() {
-                        pairs.push(("AUTH_CONNECT_STRING", connect_string, 0));
-                    }
-                }
-                pairs.push(("SESSION_CLIENT_CHARSET", "873".to_string(), 0));
-                if extras.lib_type {
-                    pairs.push(("SESSION_CLIENT_LIB_TYPE", "4".to_string(), 0));
-                }
-                pairs.push(("SESSION_CLIENT_DRIVER_NAME", self.legacy_11g_driver_name(), 0));
-                if extras.version_11g {
-                    pairs.push(("SESSION_CLIENT_VERSION", "385875968".to_string(), 0));
-                } else {
-                    pairs.push(("SESSION_CLIENT_VERSION", "54530048".to_string(), 0));
-                }
-                if extras.lobattr {
-                    pairs.push(("SESSION_CLIENT_LOBATTR", "1".to_string(), 0));
-                }
-                if extras.acl {
-                    pairs.push(("AUTH_ACL", "8800".to_string(), 0));
-                }
-                pairs.push(("AUTH_ALTER_SESSION", self.get_alter_timezone_statement(), 1));
-                if extras.logical_session_id {
-                    pairs.push(("AUTH_LOGICAL_SESSION_ID", self.logical_session_id.clone(), 0));
-                }
-                if extras.failover_id {
-                    pairs.push(("AUTH_FAILOVER_ID", String::new(), 0));
-                }
+            pairs.push(("AUTH_RTT", "0".to_string(), 0));
+            pairs.push(("AUTH_CLNT_MEM", "4096".to_string(), 0));
+            pairs.push(("AUTH_TERMINAL", self.legacy_11g_terminal(), 0));
+            pairs.push(("AUTH_PROGRAM_NM", self.legacy_11g_program_name(), 0));
+            pairs.push(("AUTH_MACHINE", self.machine.clone(), 0));
+            pairs.push(("AUTH_PID", self.legacy_11g_pid(), 0));
+            pairs.push(("AUTH_SID", self.osuser.clone(), 0));
+            if let Some(connect_string) = self.build_legacy_11g_connect_string() {
+                pairs.push(("AUTH_CONNECT_STRING", connect_string, 0));
             }
+            pairs.push(("SESSION_CLIENT_CHARSET", "873".to_string(), 0));
+            pairs.push(("SESSION_CLIENT_LIB_TYPE", "4".to_string(), 0));
+            pairs.push(("SESSION_CLIENT_DRIVER_NAME", self.legacy_11g_driver_name(), 0));
+            pairs.push(("SESSION_CLIENT_VERSION", "385875968".to_string(), 0));
+            pairs.push(("SESSION_CLIENT_LOBATTR", "1".to_string(), 0));
+            pairs.push(("AUTH_ACL", "8800".to_string(), 0));
+            pairs.push(("AUTH_ALTER_SESSION", self.get_alter_timezone_statement(), 1));
+            pairs.push(("AUTH_LOGICAL_SESSION_ID", self.logical_session_id.clone(), 0));
+            pairs.push(("AUTH_FAILOVER_ID", String::new(), 0));
         } else {
             pairs.push(("SESSION_CLIENT_CHARSET", "873".to_string(), 0));
             pairs.push(("SESSION_CLIENT_DRIVER_NAME", self.driver_name.clone(), 0));
@@ -516,8 +427,7 @@ impl AuthMessage {
 
     fn build_legacy_11g_phase_one(&self, large_sdu: bool) -> Result<Bytes> {
         let mut buf = WriteBuffer::with_capacity(512);
-        let legacy_username = self.legacy_11g_username();
-        let user_bytes = legacy_username.as_bytes();
+        let user_bytes = self.username.as_bytes();
 
         buf.write_zeros(PACKET_HEADER_SIZE)?;
         buf.write_u16_be(0)?;
@@ -550,8 +460,7 @@ impl AuthMessage {
         pairs: &[(&'static str, String, u32)],
     ) -> Result<Bytes> {
         let mut buf = WriteBuffer::with_capacity(2048);
-        let legacy_username = self.legacy_11g_username();
-        let user_bytes = legacy_username.as_bytes();
+        let user_bytes = self.username.as_bytes();
 
         buf.write_zeros(PACKET_HEADER_SIZE)?;
         buf.write_u16_be(0)?;
@@ -601,39 +510,24 @@ impl AuthMessage {
     }
 
     fn legacy_11g_driver_name(&self) -> String {
-        std::env::var("ORACLE_RS_11G_DRIVER_NAME")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "rust-oracle : 0.6.3".to_string())
-    }
-
-    fn legacy_11g_username(&self) -> String {
-        std::env::var("ORACLE_RS_11G_DB_USERNAME")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| self.username.to_ascii_lowercase())
+        // TODO: This impersonates rust-oracle's AUTH_DRIVER_NAME. It is believed to
+        // be cosmetic client info, but it is preserved verbatim to avoid any risk of
+        // breaking 11g authentication until confirmed safe to send an honest value.
+        "rust-oracle : 0.6.3".to_string()
     }
 
     fn legacy_11g_terminal(&self) -> String {
-        std::env::var("ORACLE_RS_11G_TERMINAL").unwrap_or_default()
+        String::new()
     }
 
     fn legacy_11g_program_name(&self) -> String {
-        std::env::var("ORACLE_RS_11G_PROGRAM_NAME")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| format!("   ?  @{} (TNS V1-V3)", self.machine))
+        format!("   ?  @{} (TNS V1-V3)", self.machine)
     }
 
     fn legacy_11g_pid(&self) -> String {
-        std::env::var("ORACLE_RS_11G_PID")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| {
-                let pid = self.pid.as_str();
-                let start = pid.len().saturating_sub(4);
-                pid[start..].to_string()
-            })
+        let pid = self.pid.as_str();
+        let start = pid.len().saturating_sub(4);
+        pid[start..].to_string()
     }
 
     fn build_legacy_11g_connect_string(&self) -> Option<String> {
@@ -647,10 +541,7 @@ impl AuthMessage {
         } else {
             format!("SERVICE_NAME={}", self._service_name)
         };
-        let program = std::env::var("ORACLE_RS_11G_CONNECT_PROGRAM")
-            .ok()
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "??????".to_string());
+        let program = "??????";
 
         Some(format!(
             "(DESCRIPTION=(CONNECT_DATA=({})(CID=(PROGRAM={})(HOST={})(USER={})))\
@@ -1236,5 +1127,79 @@ mod tests {
 
         assert!(msg.is_complete());
         assert_eq!(msg.session_identifiers(), Some((14, 105, 1)));
+    }
+
+    /// Snapshot the exact key/value pair sequence emitted for the 11g phase-two
+    /// auth request. This locks the wire order and the inlined default values so
+    /// that the removal of the ORACLE_RS_* env-var indirection cannot silently
+    /// change the bytes sent to an 11g server.
+    #[test]
+    fn test_legacy_11g_phase_two_pairs_snapshot() {
+        let msg = AuthMessage::new("MyUser", b"test_pass", "xe");
+        // The username must be uppercased by the constructor (matching the modern
+        // path); the 11g path no longer lowercases it.
+        assert_eq!(msg.username, "MYUSER");
+
+        let mut caps = Capabilities::new();
+        caps.protocol_version = 314;
+        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
+
+        // build_phase_two_pairs does not use combo_key for the 11g verifier type;
+        // it only needs verifier_type set and the encoded_password/session_key args.
+        let mut msg = msg;
+        msg.verifier_type = verifier_type::V11G_2;
+        msg.set_connect_descriptor_info("localhost", 1521, false);
+
+        let session_key = [0xABu8; 48];
+        let pairs = msg
+            .build_phase_two_pairs(&caps, "DEADBEEF", &session_key)
+            .unwrap();
+
+        let keys: Vec<&str> = pairs.iter().map(|(k, _, _)| *k).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "AUTH_SESSKEY",
+                "AUTH_PASSWORD",
+                "AUTH_RTT",
+                "AUTH_CLNT_MEM",
+                "AUTH_TERMINAL",
+                "AUTH_PROGRAM_NM",
+                "AUTH_MACHINE",
+                "AUTH_PID",
+                "AUTH_SID",
+                "AUTH_CONNECT_STRING",
+                "SESSION_CLIENT_CHARSET",
+                "SESSION_CLIENT_LIB_TYPE",
+                "SESSION_CLIENT_DRIVER_NAME",
+                "SESSION_CLIENT_VERSION",
+                "SESSION_CLIENT_LOBATTR",
+                "AUTH_ACL",
+                "AUTH_ALTER_SESSION",
+                "AUTH_LOGICAL_SESSION_ID",
+                "AUTH_FAILOVER_ID",
+            ]
+        );
+
+        let value = |name: &str| {
+            pairs
+                .iter()
+                .find(|(k, _, _)| *k == name)
+                .map(|(_, v, _)| v.as_str())
+                .unwrap()
+        };
+        // Lock the inlined default wire values that previously came from env vars.
+        assert_eq!(value("AUTH_RTT"), "0");
+        assert_eq!(value("AUTH_CLNT_MEM"), "4096");
+        assert_eq!(value("AUTH_TERMINAL"), "");
+        assert_eq!(value("SESSION_CLIENT_CHARSET"), "873");
+        assert_eq!(value("SESSION_CLIENT_LIB_TYPE"), "4");
+        assert_eq!(value("SESSION_CLIENT_DRIVER_NAME"), "rust-oracle : 0.6.3");
+        assert_eq!(value("SESSION_CLIENT_VERSION"), "385875968");
+        assert_eq!(value("SESSION_CLIENT_LOBATTR"), "1");
+        assert_eq!(value("AUTH_ACL"), "8800");
+        assert_eq!(value("AUTH_FAILOVER_ID"), "");
+        assert!(value("AUTH_PROGRAM_NM").ends_with("(TNS V1-V3)"));
+        assert!(value("AUTH_CONNECT_STRING").contains("(PROGRAM=??????)"));
     }
 }
