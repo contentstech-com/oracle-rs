@@ -476,8 +476,66 @@ impl ConnectionInner {
         // to fill the SDU exactly. Restoring the single-receive semantics for
         // modern protocols avoids that hang and matches long-standing behaviour;
         // the callers already handle MARKER packets and short responses.
+        //
+        // When the server DOES set the END_OF_RESPONSE data flag (protocol
+        // 319+, negotiated via supports_end_of_response), that flag is a
+        // deterministic terminator: accumulate DATA packets until it appears
+        // so responses larger than one SDU (e.g. big fetch batches) are not
+        // silently truncated at the first packet boundary.
         if !legacy_11g && !is_lob {
-            return self.receive().await;
+            if !self.capabilities.supports_end_of_response {
+                return self.receive().await;
+            }
+
+            let mut accumulated = Vec::new();
+            loop {
+                let packet = self.receive().await?;
+                if packet.len() < PACKET_HEADER_SIZE {
+                    return Err(Error::Protocol("Packet too small".to_string()));
+                }
+                // Non-DATA packet (e.g., MARKER) - return as-is for special
+                // handling by the caller.
+                if packet[4] != PacketType::Data as u8 {
+                    return Ok(packet);
+                }
+                let payload = &packet[PACKET_HEADER_SIZE..];
+                if payload.len() < 2 {
+                    return Err(Error::Protocol("DATA packet payload too small".to_string()));
+                }
+                let data_flags_value = u16::from_be_bytes([payload[0], payload[1]]);
+                if accumulated.is_empty() {
+                    accumulated.extend_from_slice(payload);
+                } else {
+                    // Subsequent packets: skip the per-packet data flags
+                    accumulated.extend_from_slice(&payload[2..]);
+                }
+                if debug {
+                    eprintln!(
+                        "oracle-rs receive_response: packet {} bytes, accumulated {} bytes, \
+                         data_flags={:#06x}",
+                        packet.len(),
+                        accumulated.len(),
+                        data_flags_value,
+                    );
+                }
+                if (data_flags_value & (data_flags::END_OF_RESPONSE | data_flags::EOF)) != 0 {
+                    break;
+                }
+            }
+
+            let total_len = PACKET_HEADER_SIZE + accumulated.len();
+            let mut result = Vec::with_capacity(total_len);
+            if self.large_sdu {
+                result.extend_from_slice(&(total_len as u32).to_be_bytes());
+            } else {
+                result.extend_from_slice(&(total_len as u16).to_be_bytes());
+                result.extend_from_slice(&[0, 0]); // Checksum
+            }
+            result.push(PacketType::Data as u8);
+            result.push(0); // Flags
+            result.extend_from_slice(&[0, 0]); // Header checksum
+            result.extend_from_slice(&accumulated);
+            return Ok(bytes::Bytes::from(result));
         }
 
         let mut accumulated_payload = Vec::new();
@@ -584,9 +642,14 @@ impl ConnectionInner {
                 };
 
             // A packet smaller than the SDU often indicates the server has no
-            // more data to send, but LOB data chunks can span such packets, so
-            // 11g LOB reads use extra slack.
-            let short_packet_slack = if legacy_11g && is_lob { 64 } else { 1 };
+            // more data to send. Oracle 11g fills data packets to slightly
+            // below the negotiated SDU (observed 8155 bytes against an SDU of
+            // 8192), so "full" is detected with slack rather than equality;
+            // multi-packet responses (large fetch batches, LOB chunks) would
+            // otherwise be truncated at the first packet. A response whose
+            // final packet lands inside the slack window is still terminated
+            // correctly, by the idle timeout instead of this heuristic.
+            let short_packet_slack = if legacy_11g { 64 } else { 1 };
             let is_short_packet = (packet.len() + short_packet_slack) < self.sdu_size as usize;
 
             if debug {
@@ -2266,7 +2329,7 @@ impl Connection {
         } else {
             let mut fetch_msg = FetchMessage::new(cursor_id, fetch_size);
             fetch_msg.set_sequence_number(inner.next_sequence_number());
-            fetch_msg.build_request(&inner.capabilities)?
+            fetch_msg.build_request_with_sdu(&inner.capabilities, inner.large_sdu)?
         };
 
         if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
@@ -2282,6 +2345,21 @@ impl Connection {
         let response = inner.receive_response().await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty fetch response".to_string()));
+        }
+        if std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some() {
+            eprintln!(
+                "oracle-rs fetch response ({} bytes): {}",
+                response.len(),
+                hex::encode(response.as_ref())
+            );
+        }
+
+        // Check for MARKER packet (indicates error)
+        let packet_type = response[4];
+        if packet_type == PacketType::Marker as u8 {
+            let error_response = inner.handle_marker_reset().await?;
+            let payload = &error_response[PACKET_HEADER_SIZE..];
+            return self.parse_error_response(payload);
         }
 
         // Parse row data from response

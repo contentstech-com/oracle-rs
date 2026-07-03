@@ -5010,3 +5010,84 @@ mod json_nesting_tests {
         conn.close().await.expect("Failed to close");
     }
 }
+
+mod large_result_tests {
+    use super::*;
+    use oracle_rs::Value;
+
+    /// Query over 1 million rows through the multi-fetch path: the initial
+    /// prefetch from `query()` followed by hundreds of `fetch_more` round
+    /// trips. Previous versions broke on result sets spanning many fetch
+    /// round trips (dropped, duplicated, or corrupted rows), so this asserts
+    /// the exact row count and that every value arrives in sequence.
+    #[tokio::test]
+    #[ignore = "requires Oracle database"]
+    async fn test_query_over_one_million_rows() {
+        // 1000 x 1024 cross join = 1,024,000 rows, numbered 1..=N by ROWNUM
+        // in fetch order. Generated on the fly so no table setup is needed.
+        const TOTAL_ROWS: u64 = 1_024_000;
+        const FETCH_SIZE: u32 = 4_000;
+        let sql = "SELECT ROWNUM AS n FROM \
+                   (SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 1000), \
+                   (SELECT LEVEL FROM DUAL CONNECT BY LEVEL <= 1024)";
+
+        let conn = connect().await.expect("Failed to connect");
+
+        let mut result = conn.query(sql, &[]).await.expect("Query failed");
+        assert_eq!(result.column_count(), 1);
+        let columns = result.columns.clone();
+        let cursor_id = result.cursor_id;
+
+        // Each round returns at least the initial prefetch size (100), so a
+        // correct driver needs far fewer rounds than this; hitting the cap
+        // means has_more_rows never cleared.
+        let max_rounds = TOTAL_ROWS / 100 + 64;
+        let mut rounds: u64 = 0;
+        let mut next_expected: u64 = 1;
+
+        loop {
+            for row in &result.rows {
+                let n = match row.get(0) {
+                    Some(Value::String(s)) => s
+                        .parse::<u64>()
+                        .unwrap_or_else(|_| panic!("Row {}: non-numeric value {:?}", next_expected, s)),
+                    Some(v) => v
+                        .as_i64()
+                        .unwrap_or_else(|| panic!("Row {}: unexpected value {:?}", next_expected, v))
+                        as u64,
+                    None => panic!("Row {}: missing value", next_expected),
+                };
+                assert_eq!(
+                    n, next_expected,
+                    "Rows out of sequence after {} rows: expected {}, got {} (dropped or duplicated rows)",
+                    next_expected - 1, next_expected, n
+                );
+                next_expected += 1;
+            }
+
+            if !result.has_more_rows {
+                break;
+            }
+            rounds += 1;
+            assert!(
+                rounds <= max_rounds,
+                "has_more_rows never cleared after {} fetch rounds ({} rows received)",
+                rounds, next_expected - 1
+            );
+            result = conn
+                .fetch_more(cursor_id, &columns, FETCH_SIZE)
+                .await
+                .unwrap_or_else(|e| panic!("fetch_more failed after {} rows: {:?}", next_expected - 1, e));
+        }
+
+        assert_eq!(
+            next_expected - 1,
+            TOTAL_ROWS,
+            "Expected {} rows, got {}",
+            TOTAL_ROWS,
+            next_expected - 1
+        );
+
+        conn.close().await.expect("Failed to close");
+    }
+}
