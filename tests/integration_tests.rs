@@ -1,19 +1,27 @@
 //! Integration tests for Oracle-RS against a real Oracle database
 //!
-//! These tests require a running Oracle instance. The easiest way is to use
-//! the included Docker Compose setup:
+//! These tests require a running Oracle instance. The included Docker Compose
+//! setup starts BOTH supported server versions side by side so the tests can be
+//! run against each:
+//!
+//! * `oracle`    - gvenzl/oracle-xe:11-slim  (Oracle 11g XE), host port 1521, service XE
+//! * `oracle23`  - gvenzl/oracle-free:slim   (Oracle 23ai Free), host port 1522, service FREEPDB1
 //!
 //! ```sh
-//! # Start Oracle (takes ~2 minutes on first run)
+//! # Start both Oracle versions (first run pulls images + inits, several minutes)
 //! docker compose -f tests/oracle/docker-compose.yml up -d
 //!
 //! # Wait for healthy status
-//! docker compose -f tests/oracle/docker-compose.yml logs -f
+//! docker compose -f tests/oracle/docker-compose.yml ps
 //!
-//! # Run integration tests (no env vars needed with defaults)
+//! # Run integration tests against 11g (defaults: port 1521, service XE)
 //! cargo test --test integration_tests -- --ignored
 //!
-//! # Stop Oracle
+//! # Run integration tests against 23ai (port 1522, service FREEPDB1)
+//! ORACLE_PORT=1522 ORACLE_SERVICE=FREEPDB1 \
+//!     cargo test --test integration_tests -- --ignored
+//!
+//! # Stop both
 //! docker compose -f tests/oracle/docker-compose.yml down
 //! ```
 //!
