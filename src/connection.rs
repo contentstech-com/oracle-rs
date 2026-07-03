@@ -2674,9 +2674,11 @@ impl Connection {
             current_row_number as u64,
         )?;
 
-        if ttc_field_version >= ccap_value::FIELD_VERSION_21_1 && read_extended_info {
-            buf.skip_ub4()?;
-            buf.skip_ub4()?;
+        // sql_type + server_checksum were added in Oracle 20c; python-oracledb
+        // gates them on TNS_CCAP_FIELD_VERSION_20_1 (14).
+        if ttc_field_version >= ccap_value::FIELD_VERSION_20_1 && read_extended_info {
+            buf.skip_ub4()?; // sql_type
+            buf.skip_ub4()?; // server_checksum
         }
 
         let more_rows = error_num == 0 && (row_count > 0 || (flags & 0x20) != 0);
@@ -4947,8 +4949,9 @@ impl Connection {
             current_row_number as u64,
         )?;
 
-        // These fields are only present in newer TTC revisions.
-        if ttc_field_version >= ccap_value::FIELD_VERSION_21_1 && read_extended_info {
+        // sql_type + server_checksum were added in Oracle 20c; python-oracledb
+        // gates them on TNS_CCAP_FIELD_VERSION_20_1 (14).
+        if ttc_field_version >= ccap_value::FIELD_VERSION_20_1 && read_extended_info {
             buf.skip_ub4()?; // sql_type
             buf.skip_ub4()?; // server_checksum
         }

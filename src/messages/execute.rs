@@ -232,12 +232,7 @@ impl<'a> ExecuteMessage<'a> {
         let mut buf = WriteBuffer::new();
 
         // Data flags (2 bytes)
-        let data_flags: u16 = if self.should_use_legacy_11g_query_layout(caps) {
-            0x2000
-        } else {
-            0
-        };
-        buf.write_u16_be(data_flags)?;
+        buf.write_u16_be(0)?;
 
         match self.function_code {
             FunctionCode::Execute => self.write_execute_message(&mut buf, caps)?,
@@ -321,7 +316,6 @@ impl<'a> ExecuteMessage<'a> {
         // execute messages.
         let suppress_initial_11g_query_fetch = caps.ttc_field_version
             <= ccap_value::FIELD_VERSION_11_2
-            && !self.should_use_legacy_11g_query_layout(caps)
             && stmt.is_query()
             && stmt.cursor_id() == 0
             && opts.execute
@@ -360,10 +354,6 @@ impl<'a> ExecuteMessage<'a> {
 
         if self.should_use_legacy_11g_fetch_layout(caps) {
             return self.write_legacy_11g_fetch_message(buf, exec_opts, caps);
-        }
-
-        if self.should_use_legacy_11g_query_layout(caps) {
-            return self.write_legacy_11g_query_message(buf, exec_opts, caps);
         }
 
         // Determine number of iterations (prefetch rows for queries, num_execs for DML)
@@ -515,26 +505,6 @@ impl<'a> ExecuteMessage<'a> {
         Ok(())
     }
 
-    fn should_use_legacy_11g_query_layout(&self, caps: &Capabilities) -> bool {
-        let stmt = self.statement;
-        let opts = &self.options;
-
-        caps.is_legacy_11g_ttc()
-            && stmt.is_query()
-            && stmt.cursor_id() == 0
-            && !stmt.sql().is_empty()
-            && !stmt.requires_define()
-            && !self.has_bind_values()
-            && !opts.describe_only
-            && opts.fetch
-            && opts.execute
-            && opts.prefetch_rows > 0
-            && !opts.scrollable
-            && !opts.scroll_operation
-            && !opts.batch_errors
-            && !opts.dml_row_counts
-    }
-
     fn should_use_legacy_11g_fetch_layout(&self, caps: &Capabilities) -> bool {
         let stmt = self.statement;
         let opts = &self.options;
@@ -555,67 +525,6 @@ impl<'a> ExecuteMessage<'a> {
             && !opts.scroll_operation
             && !opts.batch_errors
             && !opts.dml_row_counts
-    }
-
-    fn write_legacy_11g_query_message(
-        &self,
-        buf: &mut WriteBuffer,
-        exec_opts: u32,
-        caps: &Capabilities,
-    ) -> Result<()> {
-        let stmt = self.statement;
-
-        // Oracle 11g uses the OCI "thick" OALL8 wire format which is
-        // fundamentally different from the modern thin TTC layout.  The byte
-        // sequence below was captured from a successful OCI 11g execution
-        // (script/oracle_tns_dump.pcap, frame 41) and only covers the narrow
-        // "fresh cursor, unbound SELECT" path.
-        let prefetch_rows = self.options.prefetch_rows.clamp(1, 2);
-
-        // Fixed OALL8 template from the capture.  Fields that must vary
-        // (exec_opts, cursor_id, sql_len, prefetch_rows) are patched below.
-        let mut body = hex::decode(
-            "6180000000000000\
-             feffffffffffffff\
-             12000000\
-             feffffffffffffff\
-             0d000000\
-             fefffffffffffffffeffffffffffffff\
-             00000000\
-             02000000\
-             000000000000000000000000000000000000000000000000\
-             feffffffffffffff\
-             0000000000000000\
-             fefffffffffffffffefffffffffffffffeffffffffffffff\
-             0000000000000000\
-             fefffffffffffffffeffffffffffffff\
-             00000000000000000000000000000000000000000000000000000000",
-        )
-        .expect("valid OALL8 template");
-
-        // Patch exec_opts at offset 0 (4 bytes LE)
-        body[0..4].copy_from_slice(&exec_opts.to_le_bytes());
-        // Patch cursor_id at offset 4 (4 bytes LE)
-        body[4..8].copy_from_slice(&(stmt.cursor_id() as u32).to_le_bytes());
-        // Patch sql_len at offset 16 (4 bytes LE)
-        body[16..20].copy_from_slice(&(stmt.sql_bytes().len() as u32).to_le_bytes());
-        // Patch prefetch_rows at offset 52 (4 bytes LE)
-        body[52..56].copy_from_slice(&prefetch_rows.to_le_bytes());
-
-        buf.write_u8(MessageType::Function as u8)?;
-        buf.write_u8(self.function_code as u8)?;
-        buf.write_u8(self.sequence_number)?;
-        buf.write_bytes(&body)?;
-
-        // SQL text (TNS chunked encoding)
-        Self::write_sql_bytes_with_length(buf, caps, stmt.sql_bytes())?;
-
-        // al8i4 tail (13 × u32 LE) matching the captured frame
-        for value in [1u32, 0, 0, 0, 0, 0, 0, 1, 0, 0x8000, 0, 0, 0] {
-            buf.write_bytes(&value.to_le_bytes())?;
-        }
-
-        Ok(())
     }
 
     fn write_sql_bytes_with_length(
@@ -777,13 +686,7 @@ impl<'a> ExecuteMessage<'a> {
             buf.write_u8(0)?; // Scale (always 0 for defines)
             buf.write_ub4(buffer_size)?; // Buffer size
             buf.write_ub4(0)?; // Max num elements (0 for non-arrays)
-                               // Oracle 11g (TTCVersion < 10) uses UB4 for ContFlag;
-                               // 12c+ uses UB8.
-            if caps.ttc_field_version >= ccap_value::FIELD_VERSION_18_1 {
-                buf.write_ub8(cont_flag)?;
-            } else {
-                buf.write_ub4(cont_flag as u32)?;
-            }
+            buf.write_ub8(cont_flag)?; // Cont flag (LOB prefetch flag)
             buf.write_ub4(0)?; // OID (0 for non-object types)
             buf.write_ub2(0)?; // Version (0 for non-object types)
 
@@ -884,11 +787,7 @@ impl<'a> ExecuteMessage<'a> {
             buf.write_u8(0)?; // Scale (byte 3) - always 0
             buf.write_ub4(buffer_size)?; // Buffer size (bytes 4-7)
             buf.write_ub4(0)?; // Max num elements (bytes 8-11)
-            if caps.ttc_field_version >= ccap_value::FIELD_VERSION_18_1 {
-                buf.write_ub8(cont_flag)?;
-            } else {
-                buf.write_ub4(cont_flag as u32)?;
-            }
+            buf.write_ub8(cont_flag)?; // Cont flag (bytes 12-19)
 
             // For Object types, write OID + version differently per Python base.pyx:1388-1395
             // Object types write: ub4(oid_len) + bytes_with_length(oid) + ub4(version)
@@ -1517,25 +1416,6 @@ mod tests {
             !legacy_packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
             "Oracle 11g execute packets must not advertise IMPLICIT_RESULTSET"
         );
-    }
-
-    #[test]
-    fn test_legacy_11g_query_packet_matches_pcap() {
-        let stmt = Statement::new("SELECT 1 FROM DUAL");
-        let opts = ExecuteOptions::for_query(100);
-        let mut msg = ExecuteMessage::new(&stmt, opts);
-        msg.set_sequence_number(6);
-
-        let mut caps = Capabilities::new();
-        caps.protocol_version = 314;
-        caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
-
-        let packet = msg.build_request(&caps).unwrap();
-        let hex = hex::encode(packet.as_ref());
-
-        let expected = "01000000060000002000035e066180000000000000feffffffffffffff12000000feffffffffffffff0d000000fefffffffffffffffeffffffffffffff0000000002000000000000000000000000000000000000000000000000000000feffffffffffffff0000000000000000fefffffffffffffffefffffffffffffffeffffffffffffff0000000000000000fefffffffffffffffeffffffffffffff000000000000000000000000000000000000000000000000000000001253454c45435420312046524f4d204455414c01000000000000000000000000000000000000000000000000000000010000000000000000800000000000000000000000000000";
-
-        assert_eq!(hex, expected);
     }
 
     #[test]
