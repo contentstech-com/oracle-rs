@@ -156,22 +156,17 @@ impl ScrollResult {
 }
 
 /// Scroll mode for Python-compatible API
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScrollMode {
     /// Move to first row
     First,
     /// Move to last row
     Last,
     /// Move relative to current position (default)
+    #[default]
     Relative,
     /// Move to absolute position
     Absolute,
-}
-
-impl Default for ScrollMode {
-    fn default() -> Self {
-        Self::Relative
-    }
 }
 
 impl From<ScrollMode> for FetchOrientation {

@@ -3858,8 +3858,7 @@ impl Connection {
         let start = buf.position();
         let remaining = buf.remaining_slice();
 
-        for skip in 0..remaining.len() {
-            let byte = remaining[skip];
+        for (skip, &byte) in remaining.iter().enumerate() {
             if byte == MessageType::RowData as u8
                 || byte == MessageType::Error as u8
                 || byte == MessageType::BitVector as u8
@@ -3878,8 +3877,7 @@ impl Connection {
         let start = buf.position();
         let remaining = buf.remaining_slice();
 
-        for skip in 0..remaining.len() {
-            let byte = remaining[skip];
+        for (skip, &byte) in remaining.iter().enumerate() {
             if byte == MessageType::Error as u8
                 || byte == MessageType::Status as u8
                 || byte == MessageType::EndOfResponse as u8
