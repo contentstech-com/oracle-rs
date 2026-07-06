@@ -250,10 +250,13 @@ mod tests {
         let msg = ProtocolMessage::new();
         let packet = msg.build_request(&caps, false).unwrap();
 
-        assert_eq!(hex::encode(packet), concat!(
-            "002f00000600000020000107060500",
-            "4d41434f535f616172636836342f4f53582d32322e332e302d44617277696e00",
-        ));
+        assert_eq!(
+            hex::encode(packet),
+            concat!(
+                "002f00000600000020000107060500",
+                "4d41434f535f616172636836342f4f53582d32322e332e302d44617277696e00",
+            )
+        );
     }
 
     #[test]
@@ -301,10 +304,7 @@ mod tests {
         assert!(result.is_ok());
 
         assert_eq!(msg.server_version, 6);
-        assert_eq!(
-            msg.server_banner.as_deref(),
-            Some("Oracle Database 19c")
-        );
+        assert_eq!(msg.server_banner.as_deref(), Some("Oracle Database 19c"));
         assert_eq!(caps.charset_id, 873);
     }
 

@@ -2511,8 +2511,7 @@ impl Connection {
                     _ => FetchScanOutcome::Terminal,
                 };
             }
-            if msg_type == MessageType::Status as u8
-                || msg_type == MessageType::EndOfResponse as u8
+            if msg_type == MessageType::Status as u8 || msg_type == MessageType::EndOfResponse as u8
             {
                 return FetchScanOutcome::Terminal;
             }
@@ -3015,7 +3014,7 @@ impl Connection {
         buf.skip_ub1()?; // user cursor options
         buf.skip_ub1()?; // UPI parameter
         let flags = buf.read_u8()?; // flags
-        // Rowid (rba, partition_id, skip 1, block_num, slot_num)
+                                    // Rowid (rba, partition_id, skip 1, block_num, slot_num)
         buf.skip_ub4()?;
         buf.skip_ub2()?;
         buf.skip_ub1()?;
@@ -4998,8 +4997,7 @@ impl Connection {
             }
         }
 
-        let (error_code, _, _) =
-            self.read_optional_extended_error_info(buf, error_num_short, 0)?;
+        let (error_code, _, _) = self.read_optional_extended_error_info(buf, error_num_short, 0)?;
 
         // Error message
         let error_msg = self.read_optional_error_message(buf, error_code)?;
@@ -5969,10 +5967,7 @@ impl Connection {
         }
     }
 
-    fn read_legacy_11g_lob_data(
-        &self,
-        buf: &mut ReadBuffer,
-    ) -> Result<Vec<u8>> {
+    fn read_legacy_11g_lob_data(&self, buf: &mut ReadBuffer) -> Result<Vec<u8>> {
         use crate::constants::length;
 
         let length = buf.read_u8()?;
@@ -7364,10 +7359,7 @@ mod tests {
         let bytes = payload.freeze();
         let mut buf = ReadBuffer::from_slice(&bytes);
         let (code, message, cursor_id, more_rows) = conn
-            .parse_error_message_info(
-                &mut buf,
-                crate::constants::ccap_value::FIELD_VERSION_11_2,
-            )
+            .parse_error_message_info(&mut buf, crate::constants::ccap_value::FIELD_VERSION_11_2)
             .unwrap();
 
         assert_eq!(code, 1403);

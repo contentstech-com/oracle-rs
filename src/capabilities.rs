@@ -4,8 +4,7 @@
 //! that are negotiated between client and server during connection establishment.
 
 use crate::constants::{
-    accept_flags, ccap_index, ccap_value, charset, rcap_index, rcap_value, service_options,
-    version,
+    accept_flags, ccap_index, ccap_value, charset, rcap_index, rcap_value, service_options, version,
 };
 
 /// Driver name sent during protocol negotiation
@@ -440,7 +439,10 @@ mod tests {
         caps.adjust_for_server_runtime_caps(&server_rcaps);
 
         assert_eq!(caps.max_string_size, 4000);
-        assert_eq!(caps.runtime_caps[rcap_index::TTC], rcap_value::TTC_ZERO_COPY);
+        assert_eq!(
+            caps.runtime_caps[rcap_index::TTC],
+            rcap_value::TTC_ZERO_COPY
+        );
         assert_eq!(caps.compile_caps[ccap_index::LOB] & ccap_value::LOB_12C, 0);
         assert_eq!(caps.compile_caps[ccap_index::TTC3], 0);
         assert_eq!(

@@ -1379,7 +1379,9 @@ mod tests {
         let encoded_flag = [0x02, 0x40, 0x00];
 
         assert!(
-            !packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
+            !packet
+                .windows(encoded_flag.len())
+                .any(|bytes| bytes == encoded_flag),
             "Oracle 11g execute packets must not advertise DML row-count flags"
         );
     }
@@ -1399,7 +1401,9 @@ mod tests {
         modern_caps.ttc_field_version = ccap_value::FIELD_VERSION_12_1;
         let modern_packet = msg.build_request(&modern_caps).unwrap();
         assert!(
-            modern_packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
+            modern_packet
+                .windows(encoded_flag.len())
+                .any(|bytes| bytes == encoded_flag),
             "Modern (>= 12.1) execute packets must advertise IMPLICIT_RESULTSET"
         );
 
@@ -1413,7 +1417,9 @@ mod tests {
         legacy_caps.ttc_field_version = ccap_value::FIELD_VERSION_11_2;
         let legacy_packet = msg.build_request(&legacy_caps).unwrap();
         assert!(
-            !legacy_packet.windows(encoded_flag.len()).any(|bytes| bytes == encoded_flag),
+            !legacy_packet
+                .windows(encoded_flag.len())
+                .any(|bytes| bytes == encoded_flag),
             "Oracle 11g execute packets must not advertise IMPLICIT_RESULTSET"
         );
     }
@@ -1430,7 +1436,10 @@ mod tests {
 
         assert_eq!(encoded[0], length::LONG_INDICATOR);
         assert_eq!(encoded[1], length::MAX_SHORT);
-        assert_eq!(&encoded[2..2 + length::MAX_SHORT as usize], &sql[..length::MAX_SHORT as usize]);
+        assert_eq!(
+            &encoded[2..2 + length::MAX_SHORT as usize],
+            &sql[..length::MAX_SHORT as usize]
+        );
 
         let second_chunk_pos = 2 + length::MAX_SHORT as usize;
         assert_eq!(encoded[second_chunk_pos], 48);
