@@ -561,11 +561,17 @@ impl ConnectionInner {
             //   connection (the previous code raised a fatal 2s ConnectionTimeout
             //   in this situation). Blocking on genuinely incomplete data is the
             //   correct behaviour.
-            // * On 11g (protocol 314) the server never sets END_OF_RESPONSE and
-            //   row streams have no terminator we parse, so an idle timeout is
-            //   used ONLY as a soft "no more packets are coming" signal. Its
-            //   expiry is treated as end-of-response (break and return the data
-            //   accumulated so far), never as an error.
+            // * On 11g (protocol 314) the server never sets END_OF_RESPONSE, so
+            //   for responses this generic loop cannot parse to completion an
+            //   idle timeout is used ONLY as a soft "no more packets are coming"
+            //   signal. Its expiry is treated as end-of-response (break and
+            //   return the data accumulated so far), never as an error. Row
+            //   fetch responses no longer come through here at all: they use
+            //   receive_fetch_response(), which has column metadata and
+            //   terminates deterministically on the terminal Error/Status
+            //   message instead of on silence. This loop remains for the
+            //   responses without such context (initial execute/describe, DML,
+            //   LOB operations), which fit in a single packet in practice.
             let packet = if !incomplete && legacy_11g && !is_first_packet {
                 match tokio::time::timeout(idle_timeout, self.receive()).await {
                     Ok(result) => result?,
@@ -988,6 +994,35 @@ pub struct Connection {
 
 // Connection ID counter
 static CONNECTION_ID_COUNTER: AtomicU32 = AtomicU32::new(1);
+
+/// Outcome of the check-only scan over an accumulated fetch response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FetchScanOutcome {
+    /// The terminal Error/Status message has been fully received; the
+    /// response is complete.
+    Terminal,
+    /// The stream ends mid-message (or the terminal message has not arrived
+    /// yet); more packets must be read.
+    NeedMore,
+    /// A message type the scanner cannot classify; fall back to heuristic
+    /// termination for the rest of the response.
+    Unknown,
+}
+
+/// Resumable state for [`Connection::scan_fetch_message_stream`].
+///
+/// `scan_offset` is the frontier (into the payload after the leading data
+/// flags) up to which messages have been fully parsed; it only advances past
+/// complete messages, so each scan re-examines at most one partially-received
+/// message plus newly arrived bytes. `bit_vector` mirrors the running
+/// duplicate-column bit vector exactly as `parse_fetch_response` tracks it,
+/// because it determines how many column values the next RowData message
+/// consumes from the buffer.
+#[derive(Debug, Default)]
+struct FetchScanState {
+    scan_offset: usize,
+    bit_vector: Option<Vec<u8>>,
+}
 
 impl Connection {
     /// Create a new connection to an Oracle database
@@ -2280,6 +2315,281 @@ impl Connection {
         Ok(result)
     }
 
+    /// Last-resort deadline for [`Self::receive_fetch_response`]. Its expiry
+    /// is a loud error, never a silently truncated "complete" response, so it
+    /// only needs to be large enough to never fire on a healthy connection.
+    fn fetch_response_deadline() -> std::time::Duration {
+        std::env::var("ORACLE_RS_FETCH_RESPONSE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(std::time::Duration::from_secs)
+            .unwrap_or_else(|| std::time::Duration::from_secs(60))
+    }
+
+    /// Receive a complete fetch response using parse-driven termination.
+    ///
+    /// Every fetch round trip, on every supported server version, ends with
+    /// an in-band terminal message: an Error message carrying the end-of-call
+    /// status (error 0 = success/more rows, ORA-1403 = end of data) or a
+    /// Status message. A fetch response is therefore complete exactly when
+    /// that message has been fully received — never before, and never because
+    /// of how the server happened to packetize it. Column metadata makes the
+    /// row-bearing messages parseable here, which the generic inspector used
+    /// by `receive_response` cannot do, so this loop never has to guess from
+    /// packet sizes or inter-packet silence:
+    ///
+    /// * scanner says the stream ends mid-message or the terminal message has
+    ///   not arrived → block for the next packet (the server has more to
+    ///   send; turning slowness into truncation here is what previously lost
+    ///   rows and desynced the delta-encoded 11g row stream);
+    /// * scanner reaches the terminal message (or, on 23ai+, the server sets
+    ///   the END_OF_RESPONSE data flag) → response complete;
+    /// * scanner meets a message type it cannot classify → fall back to the
+    ///   pre-existing heuristics (short packet, 11g idle timeout) rather than
+    ///   risk stalling on an unknown stream shape.
+    async fn receive_fetch_response(
+        &self,
+        inner: &mut ConnectionInner,
+        columns: &[ColumnInfo],
+    ) -> Result<bytes::Bytes> {
+        use crate::constants::data_flags;
+
+        // 23ai+ delimits responses with the END_OF_RESPONSE data flag; the
+        // flag-driven accumulation in receive_response() is already
+        // deterministic there and also consumes messages that trail the
+        // error info (which stopping at the terminal message would cut
+        // short, leaving unread packets to desync the next call).
+        if inner.capabilities.supports_end_of_response {
+            return inner.receive_response().await;
+        }
+
+        let debug = std::env::var_os("ORACLE_RS_DEBUG_QUERY").is_some();
+        let caps = inner.capabilities.clone();
+        let legacy_11g = inner.server_info.protocol_version <= version::MIN_ACCEPTED;
+        let overall_deadline = Self::fetch_response_deadline();
+        let deadline = tokio::time::Instant::now() + overall_deadline;
+        let idle_timeout = std::time::Duration::from_secs(2);
+
+        let mut accumulated_payload: Vec<u8> = Vec::new();
+        let mut is_first_packet = true;
+        let mut scan_state = FetchScanState::default();
+        let mut scan_broken = false;
+
+        loop {
+            let packet = if scan_broken && legacy_11g && !is_first_packet {
+                // Heuristic fallback only: on 11g an idle gap is taken as
+                // end-of-response, matching the pre-existing behaviour of
+                // receive_response() for streams we cannot classify.
+                match tokio::time::timeout(idle_timeout, inner.receive()).await {
+                    Ok(result) => result?,
+                    Err(_) => break,
+                }
+            } else {
+                match tokio::time::timeout_at(deadline, inner.receive()).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        // The response is provably incomplete (the terminal
+                        // message has not arrived). Treating it as complete
+                        // would silently drop rows; fail loudly instead. The
+                        // connection may be left mid-response, which is why
+                        // this maps to a fatal connection error.
+                        return Err(Error::ConnectionTimeout(overall_deadline));
+                    }
+                }
+            };
+
+            if packet.len() < PACKET_HEADER_SIZE {
+                return Err(Error::Protocol("Packet too small".to_string()));
+            }
+            // Non-DATA packet (e.g., MARKER) - return as-is for special
+            // handling by the caller.
+            if packet[4] != PacketType::Data as u8 {
+                return Ok(packet);
+            }
+            let payload = &packet[PACKET_HEADER_SIZE..];
+            if payload.len() < 2 {
+                return Err(Error::Protocol("DATA packet payload too small".to_string()));
+            }
+            let data_flags_value = u16::from_be_bytes([payload[0], payload[1]]);
+            let has_end_flag =
+                (data_flags_value & (data_flags::END_OF_RESPONSE | data_flags::EOF)) != 0;
+            let has_end_message =
+                payload.len() == 3 && payload[2] == MessageType::EndOfResponse as u8;
+
+            if is_first_packet {
+                accumulated_payload.extend_from_slice(payload);
+                is_first_packet = false;
+            } else {
+                // Subsequent packets: skip the per-packet data flags
+                accumulated_payload.extend_from_slice(&payload[2..]);
+            }
+
+            if has_end_flag || has_end_message {
+                break;
+            }
+
+            if !scan_broken && accumulated_payload.len() > 2 {
+                let outcome = self.scan_fetch_message_stream(
+                    &accumulated_payload[2..],
+                    columns,
+                    &caps,
+                    &mut scan_state,
+                );
+                if debug {
+                    eprintln!(
+                        "oracle-rs receive_fetch_response: packet {} bytes, accumulated {} \
+                         bytes, scan={:?}, frontier={}",
+                        packet.len(),
+                        accumulated_payload.len(),
+                        outcome,
+                        scan_state.scan_offset,
+                    );
+                }
+                match outcome {
+                    FetchScanOutcome::Terminal => break,
+                    FetchScanOutcome::NeedMore => continue,
+                    FetchScanOutcome::Unknown => scan_broken = true,
+                }
+            }
+
+            // Heuristic termination for streams the scanner cannot classify
+            // (pre-existing receive_response() behaviour).
+            if !legacy_11g {
+                break;
+            }
+            let short_packet_slack = 64usize;
+            if packet.len() + short_packet_slack < inner.sdu_size as usize {
+                break;
+            }
+            // Full-sized 11g packet: loop; the idle timeout above concludes
+            // the response if no further packet arrives.
+        }
+
+        // Build a synthetic packet with combined payload
+        let total_len = PACKET_HEADER_SIZE + accumulated_payload.len();
+        let mut result = Vec::with_capacity(total_len);
+        if inner.large_sdu {
+            result.extend_from_slice(&(total_len as u32).to_be_bytes());
+        } else {
+            result.extend_from_slice(&(total_len as u16).to_be_bytes());
+            result.extend_from_slice(&[0, 0]); // Checksum
+        }
+        result.push(PacketType::Data as u8);
+        result.push(0); // Flags
+        result.extend_from_slice(&[0, 0]); // Header checksum
+        result.extend_from_slice(&accumulated_payload);
+        Ok(bytes::Bytes::from(result))
+    }
+
+    /// Check-only walk over the message stream of an accumulated fetch
+    /// response, mirroring exactly what `parse_fetch_response` will consume.
+    ///
+    /// `data` is the accumulated payload after the leading data flags. Only
+    /// `Error::BufferUnderflow` is treated as "more data needed": it is the
+    /// one error that appending bytes can cure. Any other parse failure is
+    /// deterministic content corruption, so the buffer is delivered
+    /// (`Terminal`) and the real parse surfaces the same error.
+    fn scan_fetch_message_stream(
+        &self,
+        data: &[u8],
+        columns: &[ColumnInfo],
+        caps: &Capabilities,
+        state: &mut FetchScanState,
+    ) -> FetchScanOutcome {
+        let base = state.scan_offset.min(data.len());
+        let mut buf = ReadBuffer::from_slice(&data[base..]);
+
+        while buf.remaining() > 0 {
+            let msg_type = match buf.read_u8() {
+                Ok(t) => t,
+                Err(_) => return FetchScanOutcome::NeedMore,
+            };
+
+            if msg_type == MessageType::Error as u8 {
+                return match self.parse_error_message_info(&mut buf, caps.ttc_field_version) {
+                    Err(Error::BufferUnderflow { .. }) => FetchScanOutcome::NeedMore,
+                    _ => FetchScanOutcome::Terminal,
+                };
+            }
+            if msg_type == MessageType::Status as u8
+                || msg_type == MessageType::EndOfResponse as u8
+            {
+                return FetchScanOutcome::Terminal;
+            }
+
+            if msg_type == MessageType::RowHeader as u8 {
+                match Self::scan_row_header(&mut buf) {
+                    Ok(Some(bv)) => state.bit_vector = Some(bv),
+                    Ok(None) => {}
+                    Err(Error::BufferUnderflow { .. }) => return FetchScanOutcome::NeedMore,
+                    Err(_) => return FetchScanOutcome::Terminal,
+                }
+            } else if msg_type == MessageType::RowData as u8 {
+                match self.parse_row_data_with_bitvector(
+                    &mut buf,
+                    columns,
+                    caps,
+                    state.bit_vector.as_deref(),
+                    None,
+                ) {
+                    Ok(_) => state.bit_vector = None,
+                    Err(Error::BufferUnderflow { .. }) => return FetchScanOutcome::NeedMore,
+                    Err(_) => return FetchScanOutcome::Terminal,
+                }
+            } else if msg_type == MessageType::BitVector as u8 {
+                match Self::scan_bit_vector(&mut buf, columns.len()) {
+                    Ok(Some(bv)) => state.bit_vector = Some(bv),
+                    Ok(None) => {}
+                    Err(Error::BufferUnderflow { .. }) => return FetchScanOutcome::NeedMore,
+                    Err(_) => return FetchScanOutcome::Terminal,
+                }
+            } else {
+                return FetchScanOutcome::Unknown;
+            }
+
+            state.scan_offset = base + buf.position();
+        }
+
+        // All accumulated bytes form complete messages but the terminal
+        // Error/Status message has not arrived yet: more packets are coming.
+        FetchScanOutcome::NeedMore
+    }
+
+    /// Structural skip of a RowHeader message body, byte-for-byte identical
+    /// to the RowHeader arm of `parse_fetch_response`. Returns the bit vector
+    /// if the header carried one.
+    fn scan_row_header(buf: &mut ReadBuffer) -> Result<Option<Vec<u8>>> {
+        buf.skip(1)?; // flags
+        buf.skip_ub2()?; // num requests
+        buf.skip_ub4()?; // iteration number
+        buf.skip_ub4()?; // num iters
+        buf.skip_ub2()?; // buffer length
+        let num_bytes = buf.read_ub4()?;
+        let bit_vector = if num_bytes > 0 {
+            buf.skip(1)?; // repeated length
+            Some(buf.read_bytes_vec(num_bytes as usize)?)
+        } else {
+            None
+        };
+        let rxhrid_bytes = buf.read_ub4()?;
+        if rxhrid_bytes > 0 {
+            buf.skip_raw_bytes_chunked()?;
+        }
+        Ok(bit_vector)
+    }
+
+    /// Structural skip of a BitVector message body, byte-for-byte identical
+    /// to the BitVector arm of `parse_fetch_response`.
+    fn scan_bit_vector(buf: &mut ReadBuffer, num_columns: usize) -> Result<Option<Vec<u8>>> {
+        buf.read_ub2()?; // num columns sent
+        let num_bytes = (num_columns + 7) / 8;
+        if num_bytes > 0 {
+            Ok(Some(buf.read_bytes_vec(num_bytes)?))
+        } else {
+            Ok(None)
+        }
+    }
+
     /// Fetch more rows from an open cursor
     ///
     /// This method is used when a query result has `has_more_rows == true`
@@ -2341,8 +2651,9 @@ impl Connection {
         }
         inner.send(&request).await?;
 
-        // Receive and parse response
-        let response = inner.receive_response().await?;
+        // Receive and parse response (parse-driven termination: complete
+        // exactly when the terminal Error/Status message has arrived)
+        let response = self.receive_fetch_response(&mut inner, columns).await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty fetch response".to_string()));
         }
@@ -2475,8 +2786,11 @@ impl Connection {
         }
         inner.send(&request).await?;
 
-        // Receive and parse response
-        let response = inner.receive_response().await?;
+        // Receive and parse response (parse-driven termination: complete
+        // exactly when the terminal Error/Status message has arrived)
+        let response = self
+            .receive_fetch_response(&mut inner, cursor.columns())
+            .await?;
         if response.len() <= PACKET_HEADER_SIZE {
             return Err(Error::Protocol("Empty cursor response".to_string()));
         }
@@ -6814,6 +7128,122 @@ mod tests {
         assert_eq!(
             inner.inspect_message_stream_with_lob_parameter_len(&data, Some(4)),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_status_is_terminal() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        assert_eq!(
+            conn.scan_fetch_message_stream(&[MessageType::Status as u8], &cols, &caps, &mut state),
+            FetchScanOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_unknown_message_falls_back() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        assert_eq!(
+            conn.scan_fetch_message_stream(
+                &[MessageType::Parameter as u8, 1, 2, 3],
+                &cols,
+                &caps,
+                &mut state
+            ),
+            FetchScanOutcome::Unknown
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_split_row_resumes_and_terminates_on_error_message() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        // RowData for one NUMBER column (value 1 = c1 02), truncated after
+        // the first value byte: provably mid-message.
+        let mut data = vec![MessageType::RowData as u8, 2, 0xc1];
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::NeedMore
+        );
+        assert_eq!(state.scan_offset, 0);
+
+        // Complete the row: all messages parse, but the terminal Error
+        // message has not arrived yet, so the response is still incomplete.
+        data.push(0x02);
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::NeedMore
+        );
+        assert_eq!(state.scan_offset, data.len());
+
+        // Append a zero-filled Error message (call status 0, error 0): the
+        // terminal message completes the response.
+        data.push(MessageType::Error as u8);
+        data.extend(std::iter::repeat(0u8).take(48));
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_bit_vector_changes_row_width() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![
+            ColumnInfo::new("A", OracleType::Number),
+            ColumnInfo::new("B", OracleType::Number),
+        ];
+        let mut state = FetchScanState::default();
+
+        // BitVector: 2 columns sent (ub2 = [1, 2]), bit 0 set / bit 1 clear,
+        // so the following RowData carries only column A; column B is a
+        // duplicate and consumes no bytes. Status terminates the stream.
+        let data = vec![
+            MessageType::BitVector as u8,
+            1,
+            2,
+            0b0000_0001,
+            MessageType::RowData as u8,
+            2,
+            0xc1,
+            0x02,
+            MessageType::Status as u8,
+        ];
+        assert_eq!(
+            conn.scan_fetch_message_stream(&data, &cols, &caps, &mut state),
+            FetchScanOutcome::Terminal
+        );
+    }
+
+    #[test]
+    fn test_scan_fetch_stream_truncated_error_message_needs_more() {
+        let conn = make_test_connection();
+        let caps = Capabilities::default();
+        let cols = vec![ColumnInfo::new("ID", OracleType::Number)];
+        let mut state = FetchScanState::default();
+
+        // Error message truncated a few fields in: the terminal message
+        // itself is split across packets, so the response is not complete.
+        assert_eq!(
+            conn.scan_fetch_message_stream(
+                &[MessageType::Error as u8, 0, 0, 0],
+                &cols,
+                &caps,
+                &mut state
+            ),
+            FetchScanOutcome::NeedMore
         );
     }
 
