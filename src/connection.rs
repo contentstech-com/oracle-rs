@@ -2323,7 +2323,7 @@ impl Connection {
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .map(std::time::Duration::from_secs)
-            .unwrap_or_else(|| std::time::Duration::from_secs(60))
+            .unwrap_or_else(|| std::time::Duration::from_secs(120))
     }
 
     /// Receive a complete fetch response using parse-driven termination.
