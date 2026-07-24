@@ -4629,9 +4629,30 @@ impl Connection {
             return self.parse_object_value(buf, col);
         }
 
-        // Read the value based on the column type
-        // First, check if it's NULL
-        let data = buf.read_bytes_with_length()?;
+        // Oracle 11g uses raw one-byte chunk lengths for long fetched values,
+        // while newer TTC versions encode each chunk length as a UB4.
+        let data = if caps.is_legacy_11g_ttc() {
+            use crate::constants::length;
+
+            let len = buf.read_u8()?;
+            if len == length::NULL_INDICATOR {
+                None
+            } else if len == length::LONG_INDICATOR {
+                let mut bytes = Vec::new();
+                loop {
+                    let chunk_len = buf.read_u8()? as usize;
+                    if chunk_len == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&buf.read_bytes_vec(chunk_len)?);
+                }
+                Some(bytes)
+            } else {
+                Some(buf.read_bytes_vec(len as usize)?)
+            }
+        } else {
+            buf.read_bytes_with_length()?
+        };
 
         match data {
             None => Ok(Value::Null),
@@ -7266,6 +7287,86 @@ mod tests {
             LobData::String(text) => assert_eq!(text.as_bytes(), &[0xc3, 0xa9, 0xc3, 0xa9]),
             other => panic!("Expected CLOB string, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_parse_legacy_11g_long_varchar_with_split_multibyte_character() {
+        let conn = make_test_connection();
+        let col = ColumnInfo::new("ARTIST", OracleType::Varchar);
+        let mut caps = Capabilities::new();
+        caps.ttc_field_version = crate::constants::ccap_value::FIELD_VERSION_11_2;
+
+        // The first byte of "é" ends chunk 1 and the second starts chunk 2.
+        // Decoding must happen after all 255 + 255 + 131 bytes are assembled.
+        let expected = format!("{}é{}{}", "a".repeat(254), "b".repeat(254), "c".repeat(131));
+        assert_eq!(expected.len(), 641);
+
+        let bytes = expected.as_bytes();
+        let mut payload = vec![
+            crate::constants::length::LONG_INDICATOR,
+            crate::constants::length::NULL_INDICATOR,
+        ];
+        payload.extend_from_slice(&bytes[..255]);
+        payload.push(crate::constants::length::NULL_INDICATOR);
+        payload.extend_from_slice(&bytes[255..510]);
+        payload.push(131);
+        payload.extend_from_slice(&bytes[510..]);
+        payload.push(0);
+
+        let mut buf = ReadBuffer::from_vec(payload.clone());
+        let value = conn.parse_column_value(&mut buf, &col, &caps).unwrap();
+
+        match value {
+            Value::String(value) => assert_eq!(value, expected),
+            other => panic!("Expected VARCHAR string, got {:?}", other),
+        }
+        assert_eq!(buf.remaining(), 0);
+
+        let mut stream = vec![MessageType::RowData as u8];
+        stream.extend_from_slice(&payload);
+        let mut state = FetchScanState::default();
+        assert_eq!(
+            conn.scan_fetch_message_stream(&stream, std::slice::from_ref(&col), &caps, &mut state),
+            FetchScanOutcome::NeedMore
+        );
+        assert_eq!(state.scan_offset, stream.len());
+    }
+
+    #[test]
+    fn test_parse_legacy_11g_initial_null_and_empty_indicators_are_null() {
+        let conn = make_test_connection();
+        let col = ColumnInfo::new("ARTIST", OracleType::Varchar);
+        let mut caps = Capabilities::new();
+        caps.ttc_field_version = crate::constants::ccap_value::FIELD_VERSION_11_2;
+
+        for indicator in [crate::constants::length::NULL_INDICATOR, 0] {
+            let mut buf = ReadBuffer::from_slice(&[indicator]);
+            assert!(matches!(
+                conn.parse_column_value(&mut buf, &col, &caps).unwrap(),
+                Value::Null
+            ));
+        }
+    }
+
+    #[test]
+    fn test_parse_modern_long_varchar_keeps_ub4_chunk_lengths() {
+        let conn = make_test_connection();
+        let col = ColumnInfo::new("ARTIST", OracleType::Varchar);
+        let caps = Capabilities::new();
+        let expected = "x".repeat(641);
+
+        let mut payload = vec![crate::constants::length::LONG_INDICATOR, 2, 0x02, 0x81];
+        payload.extend_from_slice(expected.as_bytes());
+        payload.push(0);
+
+        let mut buf = ReadBuffer::from_vec(payload);
+        let value = conn.parse_column_value(&mut buf, &col, &caps).unwrap();
+
+        match value {
+            Value::String(value) => assert_eq!(value, expected),
+            other => panic!("Expected VARCHAR string, got {:?}", other),
+        }
+        assert_eq!(buf.remaining(), 0);
     }
 
     #[test]

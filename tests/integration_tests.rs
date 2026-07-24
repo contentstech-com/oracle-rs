@@ -5799,6 +5799,44 @@ mod large_result_tests {
     use super::*;
     use oracle_rs::Value;
 
+    #[tokio::test]
+    #[ignore = "requires Oracle 11g database"]
+    async fn test_legacy_11g_long_varchar_through_fetch_more() {
+        let conn = connect().await.expect("Failed to connect");
+        if !is_oracle_11g(&conn).await {
+            eprintln!("Skipping legacy long VARCHAR test on newer Oracle");
+            conn.close().await.expect("Failed to close");
+            return;
+        }
+
+        let mut result = conn
+            .query(
+                "SELECT LEVEL AS id, RPAD('X', 641, 'X') AS artist \
+                 FROM dual CONNECT BY LEVEL <= 151",
+                &[],
+            )
+            .await
+            .expect("Initial query/fetch failed");
+        let expected = "X".repeat(641);
+
+        assert!(!result.rows.is_empty());
+        assert!(result.has_more_rows);
+        for row in &result.rows {
+            assert_eq!(row.get_string(1), Some(expected.as_str()));
+        }
+
+        result = conn
+            .fetch_more(result.cursor_id, &result.columns, 100)
+            .await
+            .expect("fetch_more failed for legacy long VARCHAR");
+        assert!(!result.rows.is_empty());
+        for row in &result.rows {
+            assert_eq!(row.get_string(1), Some(expected.as_str()));
+        }
+
+        conn.close().await.expect("Failed to close");
+    }
+
     /// Query over 1 million rows through the multi-fetch path: the initial
     /// prefetch from `query()` followed by hundreds of `fetch_more` round
     /// trips. Previous versions broke on result sets spanning many fetch
